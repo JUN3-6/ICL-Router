@@ -26,8 +26,16 @@ The training script intentionally does not regenerate labels.
 
 ## Train
 
+Create the conda environment first:
+
 ```bash
+bash scripts/setup_route_irl_env.sh
 conda activate route-IRL
+```
+
+Then start training:
+
+```bash
 bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 ```
 
