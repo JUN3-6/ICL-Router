@@ -63,6 +63,19 @@ Default effective batch sizes:
 - stage1: `2 GPUs * batch 1 * grad_accum 8 = 16`
 - stage2: `2 GPUs * batch 1 * grad_accum 16 = 32`
 
+The default A6000 path keeps the 7B LLM frozen:
+
+- stage1 trains the projector for 1 epoch and does not unfreeze the LLM.
+- stage2 trains the router projector while the 7B LLM remains frozen.
+
+This avoids allocating full 7B optimizer states. Full LLM fine-tuning is likely
+to OOM on 2x48GB without reliable CPU/NVMe offload. To explicitly try it:
+
+```bash
+STAGE1_EPOCHS=3 STAGE1_UNFREEZE_EPOCH=1 STAGE2_FREEZE_LLM=0 \
+  bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
+```
+
 Optimizer offload is disabled by default on A6000 because DeepSpeed CPUAdam
 often fails when the extension is not built in the environment. If 48GB VRAM is
 still insufficient, retry with:

@@ -119,6 +119,8 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=1024, help="Max input length.")
     parser.add_argument("--proj_lr", type=float, default=1e-5, help="LR for projector params.")
     parser.add_argument("--llm_lr", type=float, default=2e-6, help="LR for LLM params.")
+    parser.add_argument("--freeze_llm", action="store_true",
+                        help="Freeze the router LLM and train only the projector.")
     parser.add_argument("--num_train_epochs", type=int, default=5, help="Total epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "C2C_IRL"),
@@ -656,10 +658,16 @@ def main():
 
     # Model + optimizer groups
     composite = CompositeModel(projector, big_model)
+    if args.freeze_llm:
+        for p in composite.big_model.parameters():
+            p.requires_grad = False
     optim_groups = [
         {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
-        {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"},
     ]
+    if not args.freeze_llm:
+        optim_groups.append(
+            {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"}
+        )
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
@@ -779,6 +787,7 @@ def main():
             "micro_batch_size_per_gpu": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "offload_optimizer": args.offload_optimizer,
+            "freeze_llm": args.freeze_llm,
         },
     )
 

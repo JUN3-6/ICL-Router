@@ -35,13 +35,13 @@ OUT_DIR="${OUT_DIR:-checkpoints_c2c_projectors_p123_mcq_challenging_qwen25_7b_a6
 LOG_DIR="${LOG_DIR:-logs/c2c_projector_router_7b_a6000x2}"
 
 STAGE1_KEY="${STAGE1_KEY:-icl_stage1_qwen25_7b_projector_p123_mcq_challenging}"
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-3}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-1}"
 STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-1}"
 STAGE1_GRAD_ACCUM="${STAGE1_GRAD_ACCUM:-8}"
 STAGE1_MAX_LENGTH="${STAGE1_MAX_LENGTH:-1024}"
 STAGE1_PROJ_LR="${STAGE1_PROJ_LR:-2e-5}"
 STAGE1_LLM_LR="${STAGE1_LLM_LR:-5e-6}"
-STAGE1_UNFREEZE_EPOCH="${STAGE1_UNFREEZE_EPOCH:-1}"
+STAGE1_UNFREEZE_EPOCH="${STAGE1_UNFREEZE_EPOCH:-999}"
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-none}"
 
 STAGE2_OUT_DIR="${STAGE2_OUT_DIR:-$OUT_DIR/stage2}"
@@ -51,6 +51,7 @@ STAGE2_GRAD_ACCUM="${STAGE2_GRAD_ACCUM:-16}"
 STAGE2_MAX_LENGTH="${STAGE2_MAX_LENGTH:-1024}"
 STAGE2_PROJ_LR="${STAGE2_PROJ_LR:-1e-5}"
 STAGE2_LLM_LR="${STAGE2_LLM_LR:-2e-6}"
+STAGE2_FREEZE_LLM="${STAGE2_FREEZE_LLM:-1}"
 SEED="${SEED:-42}"
 
 WANDB_PROJECT="${WANDB_PROJECT:-C2C_IRL}"
@@ -120,6 +121,10 @@ if [[ ! -s "$stage1_llm/config.json" || ! -s "$stage1_projector/config.json" ]];
 fi
 
 echo "[$(date '+%F %T')] starting stage2 router training"
+stage2_freeze_args=()
+if [[ "$STAGE2_FREEZE_LLM" == "1" ]]; then
+  stage2_freeze_args+=(--freeze_llm)
+fi
 run_ds icl_stage2_routing_training.py \
   --base_model_name_or_path "$stage1_llm" \
   --embed_model_name_or_path "$EMBED_MODEL" \
@@ -133,6 +138,7 @@ run_ds icl_stage2_routing_training.py \
   --max_length "$STAGE2_MAX_LENGTH" \
   --proj_lr "$STAGE2_PROJ_LR" \
   --llm_lr "$STAGE2_LLM_LR" \
+  "${stage2_freeze_args[@]}" \
   --num_train_epochs "$STAGE2_EPOCHS" \
   --projector_type nonlinear \
   --cached_embedding_file "${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt" \
