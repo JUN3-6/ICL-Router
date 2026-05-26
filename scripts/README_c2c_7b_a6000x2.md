@@ -13,7 +13,7 @@ This runs the ICL-Router paper-code path with C2C candidates:
 Place the prepared router files here:
 
 ```text
-data/c2c_projectors_p123_mcq_challenging_router/
+data/c2c_projectors_p123/
   question_train.json
   question_test.json
   train_router.json
@@ -21,8 +21,10 @@ data/c2c_projectors_p123_mcq_challenging_router/
   experts_information_500.json
 ```
 
-Those files are produced from C2C candidate labels by the C2C_IRL dataset-prep script.
-The training script intentionally does not regenerate labels.
+Those files are produced from C2C candidate labels by the C2C_IRL dataset-prep
+script. The default dataset uses all 3659 train queries with four labels per
+query and does not use the previous `router_source=challenging` subset. The
+training script intentionally does not regenerate labels.
 
 ## Train
 
@@ -63,16 +65,18 @@ Default effective batch sizes:
 - stage1: `2 GPUs * batch 1 * grad_accum 8 = 16`
 - stage2: `2 GPUs * batch 1 * grad_accum 16 = 32`
 
-The default A6000 path keeps the 7B LLM frozen:
+The default A6000 path trains the 7B router LLM through LoRA:
 
-- stage1 trains the projector for 1 epoch and does not unfreeze the LLM.
-- stage2 trains the router projector while the 7B LLM remains frozen.
+- stage1 trains the projector plus LoRA adapter for 3 epochs.
+- stage2 starts from the stage1 projector/adapter and continues LoRA router
+  training.
 
-This avoids allocating full 7B optimizer states. Full LLM fine-tuning is likely
-to OOM on 2x48GB without reliable CPU/NVMe offload. To explicitly try it:
+This avoids allocating full 7B optimizer states while still updating the router
+LLM. Full LLM fine-tuning is likely to OOM on 2x48GB without reliable CPU/NVMe
+offload. To force a frozen-LLM run instead:
 
 ```bash
-STAGE1_EPOCHS=3 STAGE1_UNFREEZE_EPOCH=1 STAGE2_FREEZE_LLM=0 \
+USE_LORA=0 STAGE1_EPOCHS=1 STAGE1_UNFREEZE_EPOCH=999 STAGE2_FREEZE_LLM=1 \
   bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 ```
 

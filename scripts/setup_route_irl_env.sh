@@ -52,9 +52,11 @@ conda run --no-capture-output -n "$ENV_NAME" python - <<'PY'
 import torch
 import deepspeed
 import transformers
+import peft
 print("torch", torch.__version__, "cuda", torch.version.cuda, "cuda_available", torch.cuda.is_available())
 print("deepspeed", deepspeed.__version__)
 print("transformers", transformers.__version__)
+print("peft", peft.__version__)
 PY
 
 echo "[$(date '+%F %T')] done. Activate with: conda activate $ENV_NAME"

@@ -45,6 +45,11 @@ try:
     import wandb
 except ImportError:
     wandb = None
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
 
 from modeling_projector import (
     ProjectorConfig,
@@ -94,6 +99,17 @@ def parse_args():
                         help="Epoch after which to unfreeze the LLM.")
     parser.add_argument("--num_train_epochs", type=int, default=3,
                         help="Total number of epochs.")
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Train LoRA adapters for the router LLM instead of full LLM weights.")
+    parser.add_argument("--lora_r", type=int, default=16,
+                        help="LoRA rank for router LLM adapter training.")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha for router LLM adapter training.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout for router LLM adapter training.")
+    parser.add_argument("--lora_target_modules", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                        help="Comma-separated module names targeted by LoRA.")
 
     # Projector
     parser.add_argument("--projector_type", type=str, default="nonlinear",
@@ -363,6 +379,10 @@ def wandb_log(run, payload, step=None):
         wandb.log(payload, step=step)
 
 
+def parse_lora_target_modules(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 # --------------------------------------------------------------------------- #
 #                         Saving helper (rank-0 only)                         #
 # --------------------------------------------------------------------------- #
@@ -404,6 +424,21 @@ def save_model_and_configs(args, model_engine, key, stage: str):
                                trust_remote_code=True).save_pretrained(llm_dir)
     AutoTokenizer.from_pretrained(args.base_model_name_or_path,
                                   trust_remote_code=True).save_pretrained(llm_dir)
+    with open(os.path.join(llm_dir, "c2c_router_training_config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "base_model_name_or_path": args.base_model_name_or_path,
+                "use_lora": args.use_lora,
+                "lora_r": args.lora_r if args.use_lora else None,
+                "lora_alpha": args.lora_alpha if args.use_lora else None,
+                "lora_dropout": args.lora_dropout if args.use_lora else None,
+                "lora_target_modules": parse_lora_target_modules(args.lora_target_modules)
+                if args.use_lora else None,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # 4) generation_config.json may not be handled by save_pretrained
     src_gen_cfg = os.path.join(args.base_model_name_or_path, "generation_config.json")
@@ -469,6 +504,22 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+    if args.use_lora:
+        if get_peft_model is None:
+            raise ImportError("peft is required for --use_lora. Install it with `pip install peft`.")
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=parse_lora_target_modules(args.lora_target_modules),
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        big_model = get_peft_model(big_model, lora_cfg)
+        if hasattr(big_model, "enable_input_require_grads"):
+            big_model.enable_input_require_grads()
+        if get_rank() == 0:
+            big_model.print_trainable_parameters()
     big_model.config.use_cache = False
     big_model.gradient_checkpointing_enable()
     big_model.to(device)
@@ -727,6 +778,12 @@ def main():
             "ignore_unused_parameters": True,
         },
     }
+    if args.use_lora:
+        ds_cfg["scheduler"]["param_schedulers"]["big_model_lora"] = {
+            "scheduler": "WarmupCosineLR",
+            "warmup_num_steps": warmup_steps,
+            "total_num_steps": total_update_steps,
+        }
     if args.offload_optimizer == "cpu":
         ds_cfg["optimizer"]["params"].pop("torch_adam", None)
         ds_cfg["optimizer"]["params"]["fp32_optimizer_states"] = False
@@ -736,12 +793,20 @@ def main():
         }
 
     composite = CompositeModel(projector, big_model)
-    for p in composite.big_model.parameters():
-        p.requires_grad = False  # start frozen
+    if not args.use_lora:
+        for p in composite.big_model.parameters():
+            p.requires_grad = False  # start frozen
 
     optim_groups = [
         {"params": composite.projector.parameters(), "lr": args.lr, "weight_decay": 0.01, "name": "projector"}
     ]
+    if args.use_lora:
+        lora_params = [p for p in composite.big_model.parameters() if p.requires_grad]
+        if not lora_params:
+            raise RuntimeError("--use_lora was set, but no trainable LoRA parameters were found.")
+        optim_groups.append(
+            {"params": lora_params, "lr": args.llm_lr, "weight_decay": 0.01, "name": "big_model_lora"}
+        )
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         args=args, model=composite, model_parameters=optim_groups, config=ds_cfg
@@ -768,6 +833,12 @@ def main():
             "total_update_steps": total_update_steps,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "offload_optimizer": args.offload_optimizer,
+            "use_lora": args.use_lora,
+            "lora_r": args.lora_r if args.use_lora else None,
+            "lora_alpha": args.lora_alpha if args.use_lora else None,
+            "lora_dropout": args.lora_dropout if args.use_lora else None,
+            "lora_target_modules": parse_lora_target_modules(args.lora_target_modules)
+            if args.use_lora else None,
         },
     )
 
@@ -775,7 +846,7 @@ def main():
     for epoch in range(args.num_train_epochs):
 
         # Unfreeze LLM if needed
-        if epoch == args.llm_unfreeze_epoch:
+        if (not args.use_lora) and epoch == args.llm_unfreeze_epoch:
             for p in composite.big_model.parameters():
                 p.requires_grad = True
 

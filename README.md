@@ -22,6 +22,12 @@ Ensure you have all dependencies installed by running:
 pip install -r requirements.txt
 ```
 
+For the C2C projector-router experiments on a fresh conda machine:
+
+```bash
+ENV_NAME=route-IRL bash scripts/setup_route_irl_env.sh
+```
+
 ### Challenging Query Set Construction
 
 ```
@@ -40,6 +46,29 @@ sh ./scripts/train_stage1.sh 0,1,2,3,4,5,6,7,8
 ```bash
 # Multi-GPU: 8-GPU Training
 sh ./scripts/train_stage2.sh 0,1,2,3,4,5,6,7,8 
+```
+
+### C2C Projector Router Training
+
+The C2C script keeps the original ICL-Router two-stage flow but changes the
+candidates from LLMs to `receiver`, `behavior_p1`, `behavior_p2`, and
+`behavior_p3`. By default it uses `data/c2c_projectors_p123`, which contains all
+3659 train queries with four candidate labels per query; it does not use the
+previous `router_source=challenging` subset.
+
+The 7B router path trains the LLM through LoRA adapters to avoid the full
+fine-tuning OOM seen on 2x A6000:
+
+```bash
+git checkout c2c-projector-router-7b-a6000x2
+ENV_NAME=route-IRL bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
+```
+
+Useful overrides:
+
+```bash
+STAGE2_GRAD_ACCUM=16 USE_LORA=1 LORA_R=16 WANDB_MODE=online \
+  bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 ```
 
 We have already integrated the evaluation code into the training file. In the future, we will also reorganize the code and provide a separate evaluation file.

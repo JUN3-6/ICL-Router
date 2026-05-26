@@ -52,6 +52,12 @@ try:
     import wandb
 except ImportError:
     wandb = None
+try:
+    from peft import LoraConfig, PeftModel, get_peft_model
+except ImportError:
+    LoraConfig = None
+    PeftModel = None
+    get_peft_model = None
 
 # --------------------------------------------------------------------------- #
 #                        Local project-specific imports                       #
@@ -121,6 +127,19 @@ def parse_args():
     parser.add_argument("--llm_lr", type=float, default=2e-6, help="LR for LLM params.")
     parser.add_argument("--freeze_llm", action="store_true",
                         help="Freeze the router LLM and train only the projector.")
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Train LoRA adapters for the router LLM instead of full LLM weights.")
+    parser.add_argument("--lora_adapter_path", type=str, default=None,
+                        help="Optional stage1 LoRA adapter path to load before stage2 training.")
+    parser.add_argument("--lora_r", type=int, default=16,
+                        help="LoRA rank for router LLM adapter training.")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha for router LLM adapter training.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout for router LLM adapter training.")
+    parser.add_argument("--lora_target_modules", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                        help="Comma-separated module names targeted by LoRA.")
     parser.add_argument("--num_train_epochs", type=int, default=5, help="Total epochs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "C2C_IRL"),
@@ -407,6 +426,10 @@ def wandb_log(run, payload, step=None):
         wandb.log(payload, step=step)
 
 
+def parse_lora_target_modules(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def save_model_and_configs(args, model_engine, key, stage: str):
     """
     Save projector + LLM weights along with tokenizer and configs.
@@ -443,6 +466,22 @@ def save_model_and_configs(args, model_engine, key, stage: str):
     # 3) Config + tokenizer
     AutoConfig.from_pretrained(args.base_model_name_or_path, trust_remote_code=True).save_pretrained(llm_dir)
     AutoTokenizer.from_pretrained(args.base_model_name_or_path, trust_remote_code=True).save_pretrained(llm_dir)
+    with (llm_dir / "c2c_router_training_config.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "base_model_name_or_path": args.base_model_name_or_path,
+                "use_lora": args.use_lora,
+                "lora_adapter_path": args.lora_adapter_path,
+                "lora_r": args.lora_r if args.use_lora else None,
+                "lora_alpha": args.lora_alpha if args.use_lora else None,
+                "lora_dropout": args.lora_dropout if args.use_lora else None,
+                "lora_target_modules": parse_lora_target_modules(args.lora_target_modules)
+                if args.use_lora else None,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # 4) generation_config.json (not handled by save_pretrained)
     src = Path(args.base_model_name_or_path) / "generation_config.json"
@@ -516,6 +555,30 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+    if args.lora_adapter_path is not None:
+        if PeftModel is None:
+            raise ImportError("peft is required for --lora_adapter_path. Install it with `pip install peft`.")
+        big_model = PeftModel.from_pretrained(
+            big_model,
+            args.lora_adapter_path,
+            is_trainable=args.use_lora and not args.freeze_llm,
+        )
+    elif args.use_lora:
+        if get_peft_model is None:
+            raise ImportError("peft is required for --use_lora. Install it with `pip install peft`.")
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=parse_lora_target_modules(args.lora_target_modules),
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        big_model = get_peft_model(big_model, lora_cfg)
+    if args.use_lora and hasattr(big_model, "enable_input_require_grads"):
+        big_model.enable_input_require_grads()
+    if args.use_lora and get_rank() == 0 and hasattr(big_model, "print_trainable_parameters"):
+        big_model.print_trainable_parameters()
     big_model.config.use_cache = False
     big_model.gradient_checkpointing_enable()
     big_model.to(device)
@@ -666,8 +729,11 @@ def main():
         {"params": composite.projector.parameters(), "lr": args.proj_lr, "weight_decay": 0.01, "name": "projector"},
     ]
     if not args.freeze_llm:
+        llm_params = [p for p in composite.big_model.parameters() if p.requires_grad]
+        if args.use_lora and not llm_params:
+            raise RuntimeError("--use_lora was set, but no trainable LoRA parameters were found.")
         optim_groups.append(
-            {"params": composite.big_model.parameters(), "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"}
+            {"params": llm_params, "lr": args.llm_lr,  "weight_decay": 0.01, "name": "big_model"}
         )
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
@@ -789,6 +855,13 @@ def main():
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "offload_optimizer": args.offload_optimizer,
             "freeze_llm": args.freeze_llm,
+            "use_lora": args.use_lora,
+            "lora_adapter_path": args.lora_adapter_path,
+            "lora_r": args.lora_r if args.use_lora else None,
+            "lora_alpha": args.lora_alpha if args.use_lora else None,
+            "lora_dropout": args.lora_dropout if args.use_lora else None,
+            "lora_target_modules": parse_lora_target_modules(args.lora_target_modules)
+            if args.use_lora else None,
         },
     )
 

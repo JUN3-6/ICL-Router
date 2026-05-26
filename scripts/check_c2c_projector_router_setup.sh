@@ -11,7 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ENV_NAME="${ENV_NAME:-${CONDA_DEFAULT_ENV:-route-IRL}}"
-DATA_DIR="${DATA_DIR:-data/c2c_projectors_p123_mcq_challenging_router}"
+DATA_DIR="${DATA_DIR:-data/c2c_projectors_p123}"
 
 required_files=(
   "$DATA_DIR/question_train.json"
@@ -43,8 +43,10 @@ if [[ -s "$DATA_DIR/SHA256SUMS" ]] && command -v sha256sum >/dev/null 2>&1; then
   (cd "$DATA_DIR" && sha256sum -c SHA256SUMS)
 fi
 
+C2C_ROUTER_DATA_DIR="$DATA_DIR" \
 conda run --no-capture-output -n "$ENV_NAME" python - <<'PY'
 import json
+import os
 import pathlib
 from collections import Counter, defaultdict
 
@@ -53,12 +55,14 @@ import deepspeed
 import transformers
 import datasets
 import sentence_transformers
+import peft
 
-base = pathlib.Path("data/c2c_projectors_p123_mcq_challenging_router")
+base = pathlib.Path(os.environ["C2C_ROUTER_DATA_DIR"])
 print("python packages:")
 print("  torch", torch.__version__, "cuda", torch.version.cuda, "cuda_available", torch.cuda.is_available())
 print("  deepspeed", deepspeed.__version__)
 print("  transformers", transformers.__version__)
+print("  peft", peft.__version__)
 print("  datasets", datasets.__version__)
 print("  sentence_transformers", sentence_transformers.__version__)
 if torch.cuda.is_available():
@@ -79,7 +83,7 @@ for name in ["train_router.json", "test_router.json"]:
     rows = json.load(open(base / name, encoding="utf-8"))
     by_query = defaultdict(list)
     for row in rows:
-        by_query[row["index"]].append(row)
+        by_query[row["query"]].append(row)
     yes_dist = Counter(sum(bool(r["is_correct_direct"]) for r in group) for group in by_query.values())
     print(f"  {name} query_groups={len(by_query)} yes_count_dist={dict(sorted(yes_dist.items()))}")
 PY

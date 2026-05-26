@@ -15,6 +15,11 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+try:
+    from peft import AutoPeftModelForCausalLM, PeftModel
+except ImportError:
+    AutoPeftModelForCausalLM = None
+    PeftModel = None
 
 from icl_stage2_routing_training import (
     CompositeModel,
@@ -33,6 +38,8 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--base-model-name-or-path", type=str, default=None,
+                        help="Base LLM path/HF ID to use when the checkpoint contains only a LoRA adapter.")
     parser.add_argument("--experts-information-file", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--embedding-cache", type=Path, required=True)
@@ -62,11 +69,31 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    big_model = AutoModelForCausalLM.from_pretrained(
-        llm_dir,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        trust_remote_code=True,
-    )
+    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    if (llm_dir / "adapter_config.json").exists():
+        if AutoPeftModelForCausalLM is None:
+            raise ImportError("peft is required to load a LoRA router checkpoint. Install it with `pip install peft`.")
+        try:
+            big_model = AutoPeftModelForCausalLM.from_pretrained(
+                llm_dir,
+                torch_dtype=model_dtype,
+                trust_remote_code=True,
+            )
+        except Exception:
+            if args.base_model_name_or_path is None or PeftModel is None:
+                raise
+            base_model = AutoModelForCausalLM.from_pretrained(
+                args.base_model_name_or_path,
+                torch_dtype=model_dtype,
+                trust_remote_code=True,
+            )
+            big_model = PeftModel.from_pretrained(base_model, llm_dir)
+    else:
+        big_model = AutoModelForCausalLM.from_pretrained(
+            llm_dir,
+            torch_dtype=model_dtype,
+            trust_remote_code=True,
+        )
     big_model.config.use_cache = False
     big_model.to(device).eval()
 
