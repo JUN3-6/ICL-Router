@@ -842,13 +842,16 @@ def main():
 
             if get_rank() == 0 and step % 5 == 0:
                 global_step = epoch * steps_per_epoch + step + 1
-                tqdm.tqdm.write(f"[Epoch {epoch}] Step {step} -- Loss: {red_loss:.4f} | "
-                                f"Grad-norm: {model_engine.get_global_grad_norm():.4f}")
+                grad_norm = model_engine.get_global_grad_norm()
+                grad_norm_value = float(grad_norm) if grad_norm is not None else float("nan")
+                loss_value = float(red_loss.item())
+                tqdm.tqdm.write(f"[Epoch {epoch}] Step {step} -- Loss: {loss_value:.4f} | "
+                                f"Grad-norm: {grad_norm_value:.4f}")
                 wandb_log(
                     wandb_run,
                     {
-                        "stage1/train_loss": float(red_loss.item()),
-                        "stage1/grad_norm": float(model_engine.get_global_grad_norm()),
+                        "stage1/train_loss": loss_value,
+                        "stage1/grad_norm": grad_norm_value,
                         "stage1/epoch": epoch,
                         "stage1/step_in_epoch": step,
                     },
