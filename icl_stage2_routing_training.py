@@ -628,7 +628,6 @@ def main():
             "type": "AdamW",
             "params": {
                 "weight_decay": 0.01,
-                "fp32_optimizer_states": False,
                 "torch_adam": True,
             },
         },
@@ -648,6 +647,8 @@ def main():
         },
     }
     if args.offload_optimizer == "cpu":
+        ds_cfg["optimizer"]["params"].pop("torch_adam", None)
+        ds_cfg["optimizer"]["params"]["fp32_optimizer_states"] = False
         ds_cfg["zero_optimization"]["offload_optimizer"] = {
             "device": "cpu",
             "pin_memory": False,
