@@ -81,6 +81,9 @@ def parse_args():
                         help="Global per-step micro-batch size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of micro-batches to accumulate before each optimizer update.")
+    parser.add_argument("--offload_optimizer", choices=["none", "cpu"],
+                        default=os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER", "none"),
+                        help="Set to cpu to use DeepSpeed CPU optimizer offload.")
 
     # Optimisation
     parser.add_argument("--lr", type=float, default=2e-5,
@@ -696,6 +699,7 @@ def main():
             "params": {
                 "weight_decay": 0.01,
                 "fp32_optimizer_states": False,
+                "torch_adam": True,
             },
         },
         "scheduler": {
@@ -721,12 +725,13 @@ def main():
             "contiguous_gradients": True,
             "round_robin_gradients": False,
             "ignore_unused_parameters": True,
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": False,
-            },
         },
     }
+    if args.offload_optimizer == "cpu":
+        ds_cfg["zero_optimization"]["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": False,
+        }
 
     composite = CompositeModel(projector, big_model)
     for p in composite.big_model.parameters():
@@ -760,6 +765,7 @@ def main():
             "total_steps": total_steps,
             "total_update_steps": total_update_steps,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "offload_optimizer": args.offload_optimizer,
         },
     )
 

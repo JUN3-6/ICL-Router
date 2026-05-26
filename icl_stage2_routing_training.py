@@ -113,6 +113,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Per-GPU micro-batch size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of micro-batches to accumulate before each optimizer update.")
+    parser.add_argument("--offload_optimizer", choices=["none", "cpu"],
+                        default=os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER", "none"),
+                        help="Set to cpu to use DeepSpeed CPU optimizer offload.")
     parser.add_argument("--max_length", type=int, default=1024, help="Max input length.")
     parser.add_argument("--proj_lr", type=float, default=1e-5, help="LR for projector params.")
     parser.add_argument("--llm_lr", type=float, default=2e-6, help="LR for LLM params.")
@@ -626,6 +629,7 @@ def main():
             "params": {
                 "weight_decay": 0.01,
                 "fp32_optimizer_states": False,
+                "torch_adam": True,
             },
         },
         "scheduler": {"type": "WarmupCosineLR", "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_update_steps}},
@@ -641,12 +645,13 @@ def main():
             "contiguous_gradients": True,
             "round_robin_gradients": False,
             "ignore_unused_parameters": True,
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": False,
-            },
         },
     }
+    if args.offload_optimizer == "cpu":
+        ds_cfg["zero_optimization"]["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": False,
+        }
 
     # Model + optimizer groups
     composite = CompositeModel(projector, big_model)
@@ -772,6 +777,7 @@ def main():
             "validation_rows": len(val_ds),
             "micro_batch_size_per_gpu": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "offload_optimizer": args.offload_optimizer,
         },
     )
 

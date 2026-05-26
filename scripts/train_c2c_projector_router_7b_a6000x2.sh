@@ -42,6 +42,7 @@ STAGE1_MAX_LENGTH="${STAGE1_MAX_LENGTH:-1024}"
 STAGE1_PROJ_LR="${STAGE1_PROJ_LR:-2e-5}"
 STAGE1_LLM_LR="${STAGE1_LLM_LR:-5e-6}"
 STAGE1_UNFREEZE_EPOCH="${STAGE1_UNFREEZE_EPOCH:-1}"
+OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-none}"
 
 STAGE2_OUT_DIR="${STAGE2_OUT_DIR:-$OUT_DIR/stage2}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
@@ -95,6 +96,7 @@ if [[ "${SKIP_STAGE1:-0}" != "1" && ! -s "$stage1_llm/config.json" ]]; then
     --max_length "$STAGE1_MAX_LENGTH" \
     --batch_size "$STAGE1_BATCH_SIZE" \
     --gradient_accumulation_steps "$STAGE1_GRAD_ACCUM" \
+    --offload_optimizer "$OFFLOAD_OPTIMIZER" \
     --lr "$STAGE1_PROJ_LR" \
     --llm_lr "$STAGE1_LLM_LR" \
     --llm_unfreeze_epoch "$STAGE1_UNFREEZE_EPOCH" \
@@ -127,6 +129,7 @@ run_ds icl_stage2_routing_training.py \
   --output_dir "$STAGE2_OUT_DIR" \
   --batch_size "$STAGE2_BATCH_SIZE" \
   --gradient_accumulation_steps "$STAGE2_GRAD_ACCUM" \
+  --offload_optimizer "$OFFLOAD_OPTIMIZER" \
   --max_length "$STAGE2_MAX_LENGTH" \
   --proj_lr "$STAGE2_PROJ_LR" \
   --llm_lr "$STAGE2_LLM_LR" \

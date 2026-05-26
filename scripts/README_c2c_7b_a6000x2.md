@@ -63,6 +63,14 @@ Default effective batch sizes:
 - stage1: `2 GPUs * batch 1 * grad_accum 8 = 16`
 - stage2: `2 GPUs * batch 1 * grad_accum 16 = 32`
 
+Optimizer offload is disabled by default on A6000 because DeepSpeed CPUAdam
+often fails when the extension is not built in the environment. If 48GB VRAM is
+still insufficient, retry with:
+
+```bash
+OFFLOAD_OPTIMIZER=cpu bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
+```
+
 ## Evaluate
 
 ```bash
