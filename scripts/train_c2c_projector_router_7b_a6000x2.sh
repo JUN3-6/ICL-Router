@@ -27,7 +27,7 @@ export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-ENV_NAME="${ENV_NAME:-route-IRL}"
+ENV_NAME="${ENV_NAME:-${CONDA_DEFAULT_ENV:-route-IRL}}"
 ROUTER_MODEL="${ROUTER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}"
 DATA_DIR="${DATA_DIR:-data/c2c_projectors_p123_mcq_challenging_router}"

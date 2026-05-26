@@ -14,7 +14,7 @@ GPU="${1:-${GPU:-0}}"
 export CUDA_VISIBLE_DEVICES="$GPU"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-ENV_NAME="${ENV_NAME:-route-IRL}"
+ENV_NAME="${ENV_NAME:-${CONDA_DEFAULT_ENV:-route-IRL}}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}"
 DATA_DIR="${DATA_DIR:-data/c2c_projectors_p123_mcq_challenging_router}"
 OUT_DIR="${OUT_DIR:-checkpoints_c2c_projectors_p123_mcq_challenging_qwen25_7b_a6000x2}"

@@ -33,6 +33,16 @@ bash scripts/setup_route_irl_env.sh
 conda activate route-IRL
 ```
 
+If you already have an active environment, the train/eval scripts use it by default.
+For example, from `(kjh_c2c)` you can run the commands directly, or set
+`ENV_NAME=kjh_c2c` explicitly.
+
+Before starting a long run, check data, imports, and visible GPUs:
+
+```bash
+bash scripts/check_c2c_projector_router_setup.sh
+```
+
 Then start training:
 
 ```bash
