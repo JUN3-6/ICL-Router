@@ -82,13 +82,15 @@ run_ds() {
 stage1_last_epoch=$((STAGE1_EPOCHS - 1))
 stage1_llm="$OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/llm"
 stage1_projector="$OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/projector"
+stage1_llm_config="$stage1_llm/config.json"
+stage1_projector_weights="$stage1_projector/model.safetensors"
 
 echo "[$(date '+%F %T')] GPUs=$GPUS_STRING NUM_GPUS=$NUM_GPUS"
 echo "[$(date '+%F %T')] router_model=$ROUTER_MODEL embed_model=$EMBED_MODEL"
 echo "[$(date '+%F %T')] data_dir=$DATA_DIR"
 echo "[$(date '+%F %T')] output_dir=$OUT_DIR"
 
-if [[ "${SKIP_STAGE1:-0}" != "1" && ! -s "$stage1_llm/config.json" ]]; then
+if [[ "${SKIP_STAGE1:-0}" != "1" && ( ! -s "$stage1_llm_config" || ! -s "$stage1_projector_weights" ) ]]; then
   echo "[$(date '+%F %T')] starting stage1 query reconstruction"
   run_ds icl_stage1_query_rec_training.py \
     --base_model_name_or_path "$ROUTER_MODEL" \
@@ -115,7 +117,7 @@ else
   echo "[$(date '+%F %T')] skipping stage1; found $stage1_llm"
 fi
 
-if [[ ! -s "$stage1_llm/config.json" || ! -s "$stage1_projector/config.json" ]]; then
+if [[ ! -s "$stage1_llm_config" || ! -s "$stage1_projector_weights" ]]; then
   echo "stage1 checkpoint is incomplete: $stage1_llm / $stage1_projector" >&2
   exit 1
 fi

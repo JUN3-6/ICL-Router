@@ -427,6 +427,7 @@ def save_model_and_configs(args, model_engine, key, stage: str):
         proj_dir / "model.safetensors",
         metadata={"format": "pt"},
     )
+    model_engine.module.projector.config.save_pretrained(proj_dir)
     print(f"[Checkpoint] Projector saved → {proj_dir}")
 
     # 2) LLM weights. Qwen ties embed_tokens.weight and lm_head.weight, so
