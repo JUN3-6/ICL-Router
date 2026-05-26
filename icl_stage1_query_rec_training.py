@@ -16,6 +16,7 @@ import shutil
 import random
 import time
 import re
+import math
 from functools import partial
 
 import numpy as np
@@ -40,6 +41,10 @@ from nltk.tokenize import sent_tokenize
 import datasets
 import deepspeed
 from safetensors.torch import save_file as safe_save_file
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from modeling_projector import (
     ProjectorConfig,
@@ -74,6 +79,8 @@ def parse_args():
                         help="Max input length fed to the LLM.")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Global per-step micro-batch size.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of micro-batches to accumulate before each optimizer update.")
 
     # Optimisation
     parser.add_argument("--lr", type=float, default=2e-5,
@@ -100,6 +107,17 @@ def parse_args():
     parser.add_argument("--cached_embedding_file", type=str,
                         default="Qwen3-8B-embedding_stage1.pt",
                         help="File used to cache text embeddings.")
+    parser.add_argument("--wandb_project", type=str,
+                        default=os.environ.get("WANDB_PROJECT", "C2C_IRL"),
+                        help="Weights & Biases project. Use empty string to disable.")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Optional Weights & Biases run name.")
+    parser.add_argument("--wandb_mode", type=str,
+                        default=os.environ.get("WANDB_MODE", "online"),
+                        help="Weights & Biases mode: online, offline, or disabled.")
+    parser.add_argument("--wandb_tags", type=str,
+                        default=os.environ.get("WANDB_TAGS", ""),
+                        help="Comma-separated Weights & Biases tags.")
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -188,7 +206,7 @@ def compute_expert_text_mapping(dataset):
     return expert_text_to_idx, global_expert_texts
 
 
-def process_batched(questions, tokenizer, template_type, expert_text_to_idx):
+def process_batched(questions, tokenizer, template_type, expert_text_to_idx, max_length=None):
     """
     Build the prompt / target tensors for a list of questions.
 
@@ -244,13 +262,6 @@ def process_batched(questions, tokenizer, template_type, expert_text_to_idx):
         # Assistant prefix
         assistant_tok = encode("<|im_start|>assistant\n")
 
-        # Gold answer (original question text)
-        gold = encode(f"{question}{tokenizer.eos_token}")
-
-        input_ids = torch.cat(
-            [template_tokens, icl_pad, sep, random_expr, assistant_tok, gold], dim=1
-        )
-
         prefix_len = (
             template_tokens.size(1)
             + 1
@@ -258,6 +269,29 @@ def process_batched(questions, tokenizer, template_type, expert_text_to_idx):
             + random_expr.size(1)
             + assistant_tok.size(1)
         )
+
+        # Gold answer (original question text). Keep the original stage-1
+        # reconstruction objective, but honor --max_length so rare very long
+        # examples do not make full-LLM unfreeze infeasible on a single 24GB GPU.
+        if max_length is not None:
+            gold_budget = max(1, max_length - prefix_len)
+            question_budget = max(0, gold_budget - 1)
+            gold_ids = tokenizer.encode(
+                question,
+                truncation=True,
+                max_length=question_budget,
+                padding=False,
+                add_special_tokens=False,
+            ) if question_budget > 0 else []
+            gold_ids.append(tokenizer.eos_token_id)
+            gold = torch.tensor([gold_ids], dtype=torch.long)
+        else:
+            gold = encode(f"{question}{tokenizer.eos_token}")
+
+        input_ids = torch.cat(
+            [template_tokens, icl_pad, sep, random_expr, assistant_tok, gold], dim=1
+        )
+
         loss_start = prefix_len - 1
         output_len = gold.size(1)
 
@@ -298,6 +332,34 @@ def get_rank() -> int:
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+def maybe_init_wandb(args, extra_config=None):
+    if get_rank() != 0 or not args.wandb_project or args.wandb_mode == "disabled":
+        return None
+    if wandb is None:
+        print("[wandb] package is not installed; skipping wandb logging.")
+        return None
+    tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+    config = vars(args).copy()
+    if extra_config:
+        config.update(extra_config)
+    try:
+        return wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or args.ckpt_key,
+            mode=args.wandb_mode,
+            tags=tags,
+            config=config,
+        )
+    except Exception as exc:
+        print(f"[wandb] init failed; skipping wandb logging: {exc}")
+        return None
+
+
+def wandb_log(run, payload, step=None):
+    if run is not None:
+        wandb.log(payload, step=step)
+
+
 # --------------------------------------------------------------------------- #
 #                         Saving helper (rank-0 only)                         #
 # --------------------------------------------------------------------------- #
@@ -323,12 +385,14 @@ def save_model_and_configs(args, model_engine, key, stage: str):
                    metadata={"format": "pt"})
     print(f"[Checkpoint] Projector saved to {projector_dir}")
 
-    # 2) LLM
+    # 2) LLM. Qwen ties embed_tokens.weight and lm_head.weight, so saving the
+    # raw state_dict with safetensors.save_file fails on shared tensors.
     llm_dir = os.path.join(ckpt_dir, "llm")
     os.makedirs(llm_dir, exist_ok=True)
-    safe_save_file(model_engine.module.big_model.state_dict(),
-                   os.path.join(llm_dir, "model.safetensors"),
-                   metadata={"format": "pt"})
+    model_engine.module.big_model.save_pretrained(
+        llm_dir,
+        safe_serialization=True,
+    )
     print(f"[Checkpoint] LLM saved to {llm_dir}")
 
     # 3) Configs
@@ -448,7 +512,11 @@ def main():
 
     elif any(k in args.embed_model_name_or_path for k in ["Qwen3-Embedding", "gte_Qwen2"]):
         embed_tokenizer = AutoTokenizer.from_pretrained(args.embed_model_name_or_path, padding_side="left")
-        embed_model = AutoModel.from_pretrained(args.embed_model_name_or_path)
+        embed_model = AutoModel.from_pretrained(
+            args.embed_model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
         in_features = embed_model.config.hidden_size
         expansion_ratio = 1
 
@@ -493,7 +561,7 @@ def main():
 
     train_ds = raw["train"].map(
         process_batched,
-        fn_kwargs=dict(tokenizer=tokenizer, template_type="qwen", expert_text_to_idx=expert_text_to_idx),
+        fn_kwargs=dict(tokenizer=tokenizer, template_type="qwen", expert_text_to_idx=expert_text_to_idx, max_length=args.max_length),
         batched=True,
         batch_size=args.batch_size,
         num_proc=8,
@@ -502,7 +570,7 @@ def main():
     )
     val_ds = raw["validation"].map(
         process_batched,
-        fn_kwargs=dict(tokenizer=tokenizer, template_type="qwen", expert_text_to_idx=expert_text_to_idx),
+        fn_kwargs=dict(tokenizer=tokenizer, template_type="qwen", expert_text_to_idx=expert_text_to_idx, max_length=args.max_length),
         batched=True,
         batch_size=args.batch_size,
         num_proc=8,
@@ -617,20 +685,27 @@ def main():
     # --------------------------- DeepSpeed config -------------------------- #
     steps_per_epoch = len(train_dl)
     total_steps = steps_per_epoch * args.num_train_epochs
-    warmup_steps = int(0.1 * total_steps)
+    total_update_steps = math.ceil(steps_per_epoch / args.gradient_accumulation_steps) * args.num_train_epochs
+    warmup_steps = int(0.1 * total_update_steps)
 
     ds_cfg = {
         "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": 1,
-        "optimizer": {"type": "AdamW", "params": {"weight_decay": 0.01}},
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "weight_decay": 0.01,
+                "fp32_optimizer_states": False,
+            },
+        },
         "scheduler": {
             "type": "WarmupCosineLR",
-            "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_steps},
+            "params": {"warmup_num_steps": warmup_steps, "total_num_steps": total_update_steps},
             "param_schedulers": {
                 "projector": {
                     "scheduler": "WarmupCosineLR",
                     "warmup_num_steps": warmup_steps,
-                    "total_num_steps": total_steps,
+                    "total_num_steps": total_update_steps,
                 }
             },
         },
@@ -639,12 +714,17 @@ def main():
         "zero_optimization": {
             "stage": 2,
             "allgather_partitions": True,
-            "allgather_bucket_size": 5e8,
-            "overlap_comm": True,
+            "allgather_bucket_size": 5e7,
+            "overlap_comm": False,
             "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
+            "reduce_bucket_size": 5e7,
             "contiguous_gradients": True,
-            "round_robin_gradients": True,
+            "round_robin_gradients": False,
+            "ignore_unused_parameters": True,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": False,
+            },
         },
     }
 
@@ -672,6 +752,16 @@ def main():
 
     
     os.makedirs(os.path.join(args.output_dir, args.ckpt_key), exist_ok=True)
+    wandb_run = maybe_init_wandb(
+        args,
+        extra_config={
+            "stage": "stage1_query_reconstruction",
+            "steps_per_epoch": steps_per_epoch,
+            "total_steps": total_steps,
+            "total_update_steps": total_update_steps,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        },
+    )
 
     # ------------------------------- Training ------------------------------ #
     for epoch in range(args.num_train_epochs):
@@ -683,12 +773,15 @@ def main():
 
             full_cfg = copy.deepcopy(ds_cfg)
             remaining_steps = total_steps - epoch * steps_per_epoch
+            remaining_update_steps = math.ceil(remaining_steps / args.gradient_accumulation_steps)
             full_cfg["scheduler"]["param_schedulers"]["big_model"] = {
                 "scheduler": "WarmupCosineLR",
-                "warmup_num_steps": int(0.1 * remaining_steps),
-                "total_num_steps": remaining_steps,
+                "warmup_num_steps": int(0.1 * remaining_update_steps),
+                "total_num_steps": remaining_update_steps,
             }
-            full_cfg["scheduler"]["param_schedulers"]["projector"]["start_step"] = epoch * steps_per_epoch
+            full_cfg["scheduler"]["param_schedulers"]["projector"]["start_step"] = math.ceil(
+                epoch * steps_per_epoch / args.gradient_accumulation_steps
+            )
 
             del model_engine, optimizer, lr_scheduler
             torch.cuda.empty_cache()
@@ -731,7 +824,6 @@ def main():
                 continue
 
             model_engine.step()
-            model_engine.zero_grad()
             torch.cuda.empty_cache()
 
             with torch.no_grad():
@@ -742,13 +834,29 @@ def main():
                 epoch_losses.append(red_loss.item())
 
             if get_rank() == 0 and step % 5 == 0:
+                global_step = epoch * steps_per_epoch + step + 1
                 tqdm.tqdm.write(f"[Epoch {epoch}] Step {step} -- Loss: {red_loss:.4f} | "
                                 f"Grad-norm: {model_engine.get_global_grad_norm():.4f}")
+                wandb_log(
+                    wandb_run,
+                    {
+                        "stage1/train_loss": float(red_loss.item()),
+                        "stage1/grad_norm": float(model_engine.get_global_grad_norm()),
+                        "stage1/epoch": epoch,
+                        "stage1/step_in_epoch": step,
+                    },
+                    step=global_step,
+                )
 
             # Periodic checkpointing
             if (step + 1) == len(train_dl):
                 if get_rank() == 0:
                     save_model_and_configs(args, model_engine, args.ckpt_key, f"epoch_{epoch}")
+                    wandb_log(
+                        wandb_run,
+                        {"stage1/checkpoint_epoch": epoch},
+                        step=(epoch + 1) * steps_per_epoch,
+                    )
 
             pbar.update(1)
 
@@ -772,9 +880,23 @@ def main():
                 val_steps += 1
 
         if get_rank() == 0:
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+            val_loss = float(val_loss_sum / (val_steps or 1))
             print(f"\n★ Epoch {epoch} complete. "
-                  f"Train-loss: {np.mean(epoch_losses):.4f} | "
-                  f"Val-loss: {val_loss_sum / (val_steps or 1):.4f}\n")
+                  f"Train-loss: {train_loss:.4f} | "
+                  f"Val-loss: {val_loss:.4f}\n")
+            wandb_log(
+                wandb_run,
+                {
+                    "stage1/epoch_train_loss": train_loss,
+                    "stage1/val_loss": val_loss,
+                    "stage1/epoch": epoch,
+                },
+                step=(epoch + 1) * steps_per_epoch,
+            )
+
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
