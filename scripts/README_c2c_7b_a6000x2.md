@@ -39,6 +39,16 @@ router rows and reuses the default alltrain stage1 projector/adapter unless
 Yes/No scoring setup. `group_softmax` is available only as an ablation because
 it couples training to a fixed candidate set.
 
+For the balanced fixed-profile dataset, use:
+
+```bash
+ROUTER_SOURCE=balanced_profile500 bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
+```
+
+This selects `data/c2c_projectors_p123_balanced_profile500`, whose profile set
+has 500 fixed queries with per-candidate Yes rates near 40-44%, and whose
+stage2 train/validation queries do not overlap that profile.
+
 ## Train
 
 Create the conda environment first:
@@ -67,7 +77,7 @@ bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 Useful overrides:
 
 ```bash
-ROUTER_SOURCE=alltrain|mcq|challenging \
+ROUTER_SOURCE=alltrain|mcq|challenging|balanced_profile500 \
 STAGE2_ROUTING_LOSS=row_bce|group_softmax \
 DATA_DIR=/path/to/router_data \
 OUT_DIR=/path/to/checkpoints \

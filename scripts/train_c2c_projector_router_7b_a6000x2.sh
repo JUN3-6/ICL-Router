@@ -56,8 +56,14 @@ case "$ROUTER_SOURCE" in
     EXTRA_TAG_DEFAULT="challenging,lora"
     RUN_SUFFIX_DEFAULT="challenging"
     ;;
+  balanced_profile500)
+    DATA_DIR_DEFAULT="data/c2c_projectors_p123_balanced_profile500"
+    OUT_DIR_DEFAULT="checkpoints_c2c_projectors_p123_balanced_profile500_qwen25_7b_lora_a6000x2"
+    EXTRA_TAG_DEFAULT="balanced_profile500,lora"
+    RUN_SUFFIX_DEFAULT="balanced_profile500"
+    ;;
   *)
-    echo "unsupported ROUTER_SOURCE=$ROUTER_SOURCE (expected alltrain, mcq, challenging)" >&2
+    echo "unsupported ROUTER_SOURCE=$ROUTER_SOURCE (expected alltrain, mcq, challenging, balanced_profile500)" >&2
     exit 1
     ;;
 esac
