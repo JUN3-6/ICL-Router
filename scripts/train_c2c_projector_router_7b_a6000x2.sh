@@ -62,6 +62,9 @@ SEED="${SEED:-42}"
 WANDB_PROJECT="${WANDB_PROJECT:-C2C_IRL}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_TAGS="${WANDB_TAGS:-paper_code,c2c_projector_router,p123,7b,a6000x2}"
+WANDB_EXTRA_TAGS="${WANDB_EXTRA_TAGS:-alltrain,lora}"
+STAGE1_WANDB_RUN_NAME="${STAGE1_WANDB_RUN_NAME:-c2c-p123-alltrain-stage1-qwen25-7b-lora-a6000x2}"
+STAGE2_WANDB_RUN_NAME="${STAGE2_WANDB_RUN_NAME:-c2c-p123-alltrain-stage2-qwen25-7b-lora-a6000x2}"
 
 required_files=(
   "$DATA_DIR/question_train.json"
@@ -129,8 +132,8 @@ if [[ "${SKIP_STAGE1:-0}" != "1" && ( ! -s "$stage1_llm_config" || ! -s "$stage1
     --cached_embedding_file "${EMBED_MODEL##*/}_stage1_c2c_p123.pt" \
     --wandb_project "$WANDB_PROJECT" \
     --wandb_mode "$WANDB_MODE" \
-    --wandb_tags "$WANDB_TAGS,alltrain,lora,stage1" \
-    --wandb_run_name "c2c-p123-alltrain-stage1-qwen25-7b-lora-a6000x2" \
+    --wandb_tags "$WANDB_TAGS,$WANDB_EXTRA_TAGS,stage1" \
+    --wandb_run_name "$STAGE1_WANDB_RUN_NAME" \
     2>&1 | tee "$LOG_DIR/stage1_qwen25_7b_a6000x2.log"
 else
   echo "[$(date '+%F %T')] skipping stage1; found $stage1_llm"
@@ -184,8 +187,8 @@ run_ds icl_stage2_routing_training.py \
   --seed "$SEED" \
   --wandb_project "$WANDB_PROJECT" \
   --wandb_mode "$WANDB_MODE" \
-  --wandb_tags "$WANDB_TAGS,alltrain,lora,stage2" \
-  --wandb_run_name "c2c-p123-alltrain-stage2-qwen25-7b-lora-a6000x2" \
+  --wandb_tags "$WANDB_TAGS,$WANDB_EXTRA_TAGS,stage2" \
+  --wandb_run_name "$STAGE2_WANDB_RUN_NAME" \
   2>&1 | tee "$LOG_DIR/stage2_qwen25_7b_a6000x2.log"
 
 echo "[$(date '+%F %T')] done"

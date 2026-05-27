@@ -589,8 +589,20 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # ---------------- Embedding model -----------------
-    # Frozen; only used to compute expert-text embeddings
-    if any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
+    # Frozen; only used to compute expert-text embeddings. If the cache is
+    # complete, the cached tensor shape is enough to initialize the projector,
+    # so do not download/load large embedding checkpoints.
+    output_root = Path(args.output_dir)
+    cache_path_for_shape = output_root / args.cached_embedding_file
+    embed_model = None
+    embed_tokenizer = None
+    if cache_path_for_shape.exists():
+        cached_for_shape = torch.load(cache_path_for_shape, map_location="cpu")
+        in_features = int(cached_for_shape["embeddings"].shape[1])
+        expansion_ratio = 1
+        if get_rank() == 0:
+            print(f"[Cache] Found embedding cache at {cache_path_for_shape}; skipping embed model load.")
+    elif any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
         embed_model = SentenceTransformer(args.embed_model_name_or_path, trust_remote_code=True)
         embed_model.max_seq_length = args.max_length
         in_features = 2048 if "stella" in args.embed_model_name_or_path else embed_model.get_sentence_embedding_dimension()
@@ -618,7 +630,8 @@ def main():
     else:
         raise ValueError("Unsupported embedding model")
 
-    embed_model.to(device).eval()
+    if embed_model is not None:
+        embed_model.to(device).eval()
 
     # ---------------- Projector -----------------------
     out_features = big_model.get_input_embeddings().weight.shape[1]
@@ -742,7 +755,6 @@ def main():
 
     # ---------------- Embedding cache ---------------
     rank, world_size = get_rank(), (dist.get_world_size() if dist.is_initialized() else 1)
-    output_root = Path(args.output_dir)
     if rank == 0:
         output_root.mkdir(parents=True, exist_ok=True)
     if dist.is_initialized():
@@ -767,6 +779,12 @@ def main():
         else:
             new_text_indices.append(-1)
             missing_texts.append(text)
+
+    if missing_texts and embed_model is None:
+        raise RuntimeError(
+            f"Embedding cache {cache_path} is incomplete ({len(missing_texts)} missing texts), "
+            "but the embedding model was not loaded. Delete or complete the cache."
+        )
 
     # Compute embeddings for new texts (distributed)
     if missing_texts:
@@ -829,8 +847,9 @@ def main():
     cached_embeds = cached["embeddings"].to(device, dtype=next(projector.parameters()).dtype)
 
     # Free embedding model memory
-    embed_model.to("cpu")
-    del embed_model
+    if embed_model is not None:
+        embed_model.to("cpu")
+        del embed_model
 
     # -------------------------------------------------------------------- #
     #                             Training loop                            #

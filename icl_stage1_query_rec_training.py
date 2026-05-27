@@ -534,7 +534,20 @@ def main():
     embedding_layer = big_model.get_input_embeddings()
 
     # --------------------------- Load embed model -------------------------- #
-    if any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
+    # If the embedding cache is already complete, the frozen embedding model is
+    # not needed for training.  Use the cached tensor shape to initialize the
+    # projector and avoid downloading/loading large embedding checkpoints.
+    cache_path = os.path.join(args.output_dir, args.cached_embedding_file)
+    cached_for_shape = None
+    embed_model = None
+    embed_tokenizer = None
+    if os.path.exists(cache_path):
+        cached_for_shape = torch.load(cache_path, map_location="cpu")
+        in_features = int(cached_for_shape["embeddings"].shape[1])
+        expansion_ratio = 1
+        if get_rank() == 0:
+            print(f"[Cache] Found embedding cache at {cache_path}; skipping embed model load.")
+    elif any(k in args.embed_model_name_or_path for k in ["stella_en_1.5B_v5", "bge"]):
         embed_model = SentenceTransformer(args.embed_model_name_or_path, trust_remote_code=True)
         embed_model.max_seq_length = args.max_length
         in_features = 2048 if "stella_en_1.5B_v5" in args.embed_model_name_or_path else \
@@ -578,9 +591,10 @@ def main():
     else:
         raise ValueError("Unsupported embedding model path")
 
-    embed_model.to(device).eval()
-    for p in embed_model.parameters():
-        p.requires_grad = False
+    if embed_model is not None:
+        embed_model.to(device).eval()
+        for p in embed_model.parameters():
+            p.requires_grad = False
 
     # --------------------------- Init projector --------------------------- #
     out_features = embedding_layer.weight.shape[1]
@@ -657,7 +671,6 @@ def main():
         )
 
     # ----------------------- Embedding cache handling ---------------------- #
-    cache_path = os.path.join(args.output_dir, args.cached_embedding_file)
     rank, world_size = get_rank(), (dist.get_world_size() if dist.is_initialized() else 1)
 
     if os.path.exists(cache_path):
@@ -676,6 +689,12 @@ def main():
         else:
             new_text_indices.append(-1)
             missing_texts.append(text)
+
+    if missing_texts and embed_model is None:
+        raise RuntimeError(
+            f"Embedding cache {cache_path} is incomplete ({len(missing_texts)} missing texts), "
+            "but the embedding model was not loaded. Delete or complete the cache."
+        )
 
     if missing_texts:  # Need to compute embeddings for new texts
         total_missing = len(missing_texts)
@@ -816,8 +835,9 @@ def main():
     cached_embeds = torch.load(cache_path, map_location="cpu")["embeddings"].to(device, dtype=proj_dtype)
 
     # Move embedding model to CPU to free VRAM
-    embed_model.to("cpu")
-    del embed_model
+    if embed_model is not None:
+        embed_model.to("cpu")
+        del embed_model
 
     loss_fn = nn.CrossEntropyLoss()
     pbar = tqdm.tqdm(total=total_steps)
