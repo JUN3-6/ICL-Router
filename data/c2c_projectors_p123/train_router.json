@@ -57686,18 +57686,18 @@
   {
     "query": "Solve the following math problem step by step. The last line of your response should only contain your final answer inside a \\boxed{} command.\n\nLet T be any number you want. Compute $2^{\\log _{T} 8}-8^{\\log _{T} 2}$.\n\nRemember to put your final answer on the last line using the format \\boxed{$ANSWER} where $ANSWER is the answer to the problem.",
     "model": "receiver",
-    "is_correct_direct": false,
+    "is_correct_direct": true,
     "is_correct": [
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
     ],
     "task": "olympiadbench",
     "index": 3035
