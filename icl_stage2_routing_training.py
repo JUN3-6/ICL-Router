@@ -464,6 +464,15 @@ def validate_router(
     max_batches: int = 0,
 ) -> Dict[str, float] | None:
     model_engine.eval()
+    lm_head = model_engine.module.big_model.get_output_embeddings()
+    yes_no_delta = (
+        lm_head.weight[yes_id].detach().float()
+        - lm_head.weight[no_id].detach().float()
+    ).to(device)
+    bias_delta = 0.0
+    if getattr(lm_head, "bias", None) is not None:
+        bias_delta = float((lm_head.bias[yes_id] - lm_head.bias[no_id]).detach().float().cpu())
+
     loss_sum = torch.tensor(0.0, device=device)
     row_count = torch.tensor(0.0, device=device)
     correct_count = torch.tensor(0.0, device=device)
@@ -481,14 +490,20 @@ def validate_router(
             m = len(batch["text_indices"][0])
             last_states = embeds.view(n, m, cached_embeds.shape[1])
 
-            logits = model_engine(
+            labels = batch["labels"].to(device)
+            mask = labels != -100
+            ans_pos = mask.float().argmax(dim=1).long()
+
+            hidden_states = model_engine(
                 last_states,
                 batch["input_ids"].to(device),
                 batch["attention_mask"].to(device),
-                logits_to_keep=2,
+                return_hidden_states_only=True,
             )
-            labels = batch["labels"].to(device)
-            scores, targets = yes_no_scores(logits, labels, yes_id, no_id)
+            b_idx = torch.arange(hidden_states.size(0), device=device)
+            ans_hidden = hidden_states[b_idx, ans_pos].float()
+            scores = ans_hidden @ yes_no_delta + bias_delta
+            targets = (labels[b_idx, ans_pos] == yes_id).float()
 
             loss_sum += F.binary_cross_entropy_with_logits(scores, targets, reduction="sum")
             row_count += targets.numel()
@@ -642,6 +657,8 @@ class CompositeModel(nn.Module):
         self.big_model = big_model
 
     def forward(self, last_states_tensor, input_ids, attention_mask, **llm_kwargs):
+        return_hidden_states_only = llm_kwargs.pop("return_hidden_states_only", False)
+
         # Project into LLM embedding space
         last_states_tensor = last_states_tensor.to(next(self.projector.parameters()).dtype)
         projected = self.projector(last_states_tensor)
@@ -661,6 +678,24 @@ class CompositeModel(nn.Module):
         replacement = torch.zeros_like(model_inp)
         replacement[mask] = projected[rows[mask], order[mask]]
         model_inp = torch.where(mask.unsqueeze(-1), replacement, model_inp)
+
+        if return_hidden_states_only:
+            base_model = (
+                self.big_model.get_base_model()
+                if hasattr(self.big_model, "get_base_model")
+                else self.big_model
+            )
+            decoder = getattr(base_model, "model", None)
+            if decoder is None:
+                raise RuntimeError("Could not find decoder model for hidden-state-only forward.")
+            outputs = decoder(
+                inputs_embeds=model_inp,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+                **llm_kwargs,
+            )
+            return outputs.last_hidden_state
 
         outputs = self.big_model(inputs_embeds=model_inp, attention_mask=attention_mask, **llm_kwargs)
         return outputs.logits
