@@ -34,9 +34,10 @@ ROUTER_SOURCE=challenging bash scripts/train_c2c_projector_router_7b_a6000x2.sh 
 
 This selects `data/c2c_projectors_p123_mcq_challenging_router` for stage2
 router rows and reuses the default alltrain stage1 projector/adapter unless
-`STAGE1_OUT_DIR` is explicitly overridden. For `ROUTER_SOURCE=challenging`,
-stage2 defaults to `STAGE2_ROUTING_LOSS=group_softmax`, which optimizes the
-query-level candidate ranking instead of independent row-wise Yes/No BCE.
+`STAGE1_OUT_DIR` is explicitly overridden. The default stage2 objective remains
+`STAGE2_ROUTING_LOSS=row_bce`, matching the ICL-Router candidate-independent
+Yes/No scoring setup. `group_softmax` is available only as an ablation because
+it couples training to a fixed candidate set.
 
 ## Train
 
