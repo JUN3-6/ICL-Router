@@ -87,6 +87,13 @@ done
 
 mkdir -p "$OUT_DIR" "$STAGE2_OUT_DIR" "$LOG_DIR"
 
+stage2_cache_file="$STAGE2_OUT_DIR/${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt"
+default_stage2_cache_file="$OUT_DIR/stage2/${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt"
+if [[ ! -s "$stage2_cache_file" && -s "$default_stage2_cache_file" ]]; then
+  cp "$default_stage2_cache_file" "$stage2_cache_file"
+  echo "[$(date '+%F %T')] copied stage2 embedding cache from $default_stage2_cache_file"
+fi
+
 run_ds() {
   conda run --no-capture-output -n "$ENV_NAME" deepspeed \
     --num_gpus "$NUM_GPUS" \
