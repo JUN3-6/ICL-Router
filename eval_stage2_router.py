@@ -157,10 +157,16 @@ def main():
                 last_states,
                 batch["input_ids"].to(device),
                 batch["attention_mask"].to(device),
+                logits_to_keep=2,
             )
             labels = batch["labels"].to(device)
             mask = labels != -100
             ans_pos = mask.float().argmax(dim=1).long()
+            if logits.size(1) != labels.size(1):
+                offset = labels.size(1) - logits.size(1)
+                if torch.any(ans_pos < offset):
+                    raise RuntimeError("Answer token is outside logits_to_keep window.")
+                ans_pos = ans_pos - offset
             b_idx = torch.arange(logits.size(0), device=device)
             score = (logits[b_idx, ans_pos, yes_id] - logits[b_idx, ans_pos, no_id]).float().cpu()
 

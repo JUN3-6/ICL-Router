@@ -119,9 +119,15 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Per-GPU micro-batch size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of micro-batches to accumulate before each optimizer update.")
+    parser.add_argument("--eval_steps", type=int, default=0,
+                        help="Run validation every N optimizer update steps. Set 0 to disable during training.")
+    parser.add_argument("--eval_max_batches", type=int, default=0,
+                        help="Maximum validation batches per rank for periodic validation. Set 0 for full validation.")
     parser.add_argument("--offload_optimizer", choices=["none", "cpu"],
                         default=os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER", "none"),
                         help="Set to cpu to use DeepSpeed CPU optimizer offload.")
+    parser.add_argument("--zero_stage", type=int, default=2, choices=[0, 1, 2, 3],
+                        help="DeepSpeed ZeRO stage. Use 0 for single-GPU full fine-tuning.")
     parser.add_argument("--max_length", type=int, default=1024, help="Max input length.")
     parser.add_argument("--proj_lr", type=float, default=1e-5, help="LR for projector params.")
     parser.add_argument("--llm_lr", type=float, default=2e-6, help="LR for LLM params.")
@@ -426,6 +432,136 @@ def wandb_log(run, payload, step=None):
         wandb.log(payload, step=step)
 
 
+def sanitize_metric_name(value: str) -> str:
+    allowed = set(string.ascii_letters + string.digits + "_.-")
+    return "".join(ch if ch in allowed else "_" for ch in str(value))[:120]
+
+
+def yes_no_scores(logits: Tensor, labels: Tensor, yes_id: int, no_id: int) -> tuple[Tensor, Tensor]:
+    mask = labels != -100
+    ans_pos = mask.float().argmax(dim=1).long()
+    b_idx = torch.arange(logits.size(0), device=logits.device)
+    targets = (labels[b_idx, ans_pos] == yes_id).float()
+
+    logit_pos = ans_pos
+    if logits.size(1) != labels.size(1):
+        offset = labels.size(1) - logits.size(1)
+        if torch.any(logit_pos < offset):
+            raise RuntimeError("Answer token is outside logits_to_keep window.")
+        logit_pos = logit_pos - offset
+
+    diff = logits[b_idx, logit_pos, yes_id] - logits[b_idx, logit_pos, no_id]
+    return diff, targets
+
+
+def validate_router(
+    model_engine,
+    val_dl,
+    cached_embeds: Tensor,
+    device: torch.device,
+    yes_id: int,
+    no_id: int,
+    max_batches: int = 0,
+) -> Dict[str, float] | None:
+    model_engine.eval()
+    loss_sum = torch.tensor(0.0, device=device)
+    row_count = torch.tensor(0.0, device=device)
+    correct_count = torch.tensor(0.0, device=device)
+    pos_count = torch.tensor(0.0, device=device)
+    local_rows = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dl):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+
+            flat_idx = [int(i) for sl in batch["text_indices"] for i in sl]
+            embeds = cached_embeds[torch.tensor(flat_idx, device=device)]
+            n = len(batch["text_indices"])
+            m = len(batch["text_indices"][0])
+            last_states = embeds.view(n, m, cached_embeds.shape[1])
+
+            logits = model_engine(
+                last_states,
+                batch["input_ids"].to(device),
+                batch["attention_mask"].to(device),
+                logits_to_keep=2,
+            )
+            labels = batch["labels"].to(device)
+            scores, targets = yes_no_scores(logits, labels, yes_id, no_id)
+
+            loss_sum += F.binary_cross_entropy_with_logits(scores, targets, reduction="sum")
+            row_count += targets.numel()
+            correct_count += ((scores > 0.0) == targets.bool()).float().sum()
+            pos_count += targets.sum()
+
+            for i, score in enumerate(scores.float().cpu().tolist()):
+                local_rows.append(
+                    {
+                        "query": batch["query"][i],
+                        "task": batch["task"][i],
+                        "index": int(batch["index"][i]),
+                        "model": batch["model"][i],
+                        "score": float(score),
+                        "pred_yes": bool(score > 0.0),
+                        "is_correct_direct": bool(batch["is_correct_direct"][i]),
+                    }
+                )
+
+    totals = torch.stack([loss_sum, row_count, correct_count, pos_count])
+    if dist.is_initialized():
+        dist.all_reduce(totals)
+        gathered_rows = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_rows, local_rows)
+        all_rows = [row for rows in gathered_rows for row in rows]
+    else:
+        all_rows = local_rows
+
+    metrics = None
+    if get_rank() == 0:
+        metrics = {
+            "stage2/val_loss": float(totals[0].item() / max(1.0, totals[1].item())),
+            "stage2/val_row_binary_accuracy": float(totals[2].item() / max(1.0, totals[1].item())),
+            "stage2/val_pos_rate": float(totals[3].item() / max(1.0, totals[1].item())),
+            "stage2/val_rows": float(totals[1].item()),
+        }
+
+        grouped = defaultdict(list)
+        for row in all_rows:
+            grouped[(row["query"], row["index"])].append(row)
+        selected = [max(rows, key=lambda row: row["score"]) for rows in grouped.values() if rows]
+        metrics["stage2/val_selected_correct"] = (
+            sum(row["is_correct_direct"] for row in selected) / max(1, len(selected))
+        )
+        metrics["stage2/val_oracle_possible"] = (
+            sum(any(row["is_correct_direct"] for row in rows) for rows in grouped.values())
+            / max(1, len(grouped))
+        )
+        metrics["stage2/val_queries"] = float(len(grouped))
+
+        candidates = sorted({row["model"] for row in all_rows})
+        for name in candidates:
+            key = sanitize_metric_name(name)
+            rows = [row for row in all_rows if row["model"] == name]
+            chosen = [row for row in selected if row["model"] == name]
+            metrics[f"stage2/val_static_acc/{key}"] = (
+                sum(row["is_correct_direct"] for row in rows) / max(1, len(rows))
+            )
+            metrics[f"stage2/val_mean_score/{key}"] = (
+                sum(row["score"] for row in rows) / max(1, len(rows))
+            )
+            metrics[f"stage2/val_selection_frac/{key}"] = len(chosen) / max(1, len(selected))
+            metrics[f"stage2/val_selection_acc/{key}"] = (
+                sum(row["is_correct_direct"] for row in chosen) / max(1, len(chosen))
+            )
+            metrics[f"stage2/val_selected_pred_yes_frac/{key}"] = (
+                sum(row["pred_yes"] for row in chosen) / max(1, len(chosen))
+            )
+
+    model_engine.train()
+    return metrics
+
+
 def parse_lora_target_modules(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -505,7 +641,7 @@ class CompositeModel(nn.Module):
         self.projector = projector
         self.big_model = big_model
 
-    def forward(self, last_states_tensor, input_ids, attention_mask):
+    def forward(self, last_states_tensor, input_ids, attention_mask, **llm_kwargs):
         # Project into LLM embedding space
         last_states_tensor = last_states_tensor.to(next(self.projector.parameters()).dtype)
         projected = self.projector(last_states_tensor)
@@ -526,7 +662,7 @@ class CompositeModel(nn.Module):
         replacement[mask] = projected[rows[mask], order[mask]]
         model_inp = torch.where(mask.unsqueeze(-1), replacement, model_inp)
 
-        outputs = self.big_model(inputs_embeds=model_inp, attention_mask=attention_mask)
+        outputs = self.big_model(inputs_embeds=model_inp, attention_mask=attention_mask, **llm_kwargs)
         return outputs.logits
 
 # --------------------------------------------------------------------------- #
@@ -714,7 +850,11 @@ def main():
         "bf16": {"enabled": True},
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,
+            "stage": int(args.zero_stage),
+        },
+    }
+    if args.zero_stage > 0:
+        ds_cfg["zero_optimization"].update({
             "allgather_partitions": True,
             "allgather_bucket_size": 5e7,
             "overlap_comm": False,
@@ -723,9 +863,10 @@ def main():
             "contiguous_gradients": True,
             "round_robin_gradients": False,
             "ignore_unused_parameters": True,
-        },
-    }
+        })
     if args.offload_optimizer == "cpu":
+        if args.zero_stage <= 0:
+            raise ValueError("--offload_optimizer cpu requires --zero_stage > 0")
         ds_cfg["optimizer"]["params"].pop("torch_adam", None)
         ds_cfg["optimizer"]["params"]["fp32_optimizer_states"] = False
         ds_cfg["zero_optimization"]["offload_optimizer"] = {
@@ -872,7 +1013,13 @@ def main():
             "validation_rows": len(val_ds),
             "micro_batch_size_per_gpu": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_batch_size": args.batch_size
+            * args.gradient_accumulation_steps
+            * (dist.get_world_size() if dist.is_initialized() else 1),
+            "eval_steps": args.eval_steps,
+            "eval_max_batches": args.eval_max_batches,
             "offload_optimizer": args.offload_optimizer,
+            "zero_stage": args.zero_stage,
             "freeze_llm": args.freeze_llm,
             "use_lora": args.use_lora,
             "lora_adapter_path": args.lora_adapter_path,
@@ -910,11 +1057,7 @@ def main():
             logits = model_engine(last_states, input_ids, attention_mask)
 
             # Binary-cross-entropy over the single answer token
-            mask = labels != -100
-            ans_pos = mask.float().argmax(dim=1).long()
-            b_idx = torch.arange(logits.size(0), device=logits.device)
-            diff = logits[b_idx, ans_pos, yes_id] - logits[b_idx, ans_pos, no_id]
-            targets = (labels[b_idx, ans_pos] == yes_id).float()
+            diff, targets = yes_no_scores(logits, labels, yes_id, no_id)
             loss = F.binary_cross_entropy_with_logits(diff, targets)
             pos_rate = targets.mean()
 
@@ -976,6 +1119,32 @@ def main():
                 if is_update_step:
                     accum_loss_sum = 0.0
                     accum_loss_count = 0
+
+            if args.eval_steps > 0 and is_update_step and update_step % args.eval_steps == 0:
+                if get_rank() == 0:
+                    tqdm.tqdm.write(
+                        f"Epoch {epoch} | Step {global_step} | Update {update_step} | "
+                        "running validation"
+                    )
+                val_metrics = validate_router(
+                    model_engine,
+                    val_dl,
+                    cached_embeds,
+                    device,
+                    yes_id,
+                    no_id,
+                    max_batches=args.eval_max_batches,
+                )
+                if get_rank() == 0 and val_metrics is not None:
+                    tqdm.tqdm.write(
+                        f"Epoch {epoch} | Step {global_step} | Update {update_step} | "
+                        f"Val-loss {val_metrics['stage2/val_loss']:.4f} | "
+                        f"Val-selected {val_metrics['stage2/val_selected_correct']:.4f} | "
+                        f"Val-oracle {val_metrics['stage2/val_oracle_possible']:.4f}"
+                    )
+                    payload = dict(val_metrics)
+                    payload["stage2/update_step"] = update_step
+                    wandb_log(wandb_run, payload, step=global_step)
 
             # Periodic checkpoint
             if global_step % 500 == 0 and global_step >= 2000 and get_rank() == 0:

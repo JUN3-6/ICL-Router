@@ -89,6 +89,8 @@ def parse_args():
     parser.add_argument("--offload_optimizer", choices=["none", "cpu"],
                         default=os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER", "none"),
                         help="Set to cpu to use DeepSpeed CPU optimizer offload.")
+    parser.add_argument("--zero_stage", type=int, default=2, choices=[0, 1, 2, 3],
+                        help="DeepSpeed ZeRO stage. Use 0 for single-GPU full fine-tuning.")
 
     # Optimisation
     parser.add_argument("--lr", type=float, default=2e-5,
@@ -786,7 +788,11 @@ def main():
         "bf16": {"enabled": True},
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,
+            "stage": int(args.zero_stage),
+        },
+    }
+    if args.zero_stage > 0:
+        ds_cfg["zero_optimization"].update({
             "allgather_partitions": True,
             "allgather_bucket_size": 5e7,
             "overlap_comm": False,
@@ -795,8 +801,7 @@ def main():
             "contiguous_gradients": True,
             "round_robin_gradients": False,
             "ignore_unused_parameters": True,
-        },
-    }
+        })
     if args.use_lora:
         ds_cfg["scheduler"]["param_schedulers"]["big_model_lora"] = {
             "scheduler": "WarmupCosineLR",
@@ -804,6 +809,8 @@ def main():
             "total_num_steps": total_update_steps,
         }
     if args.offload_optimizer == "cpu":
+        if args.zero_stage <= 0:
+            raise ValueError("--offload_optimizer cpu requires --zero_stage > 0")
         ds_cfg["optimizer"]["params"].pop("torch_adam", None)
         ds_cfg["optimizer"]["params"]["fp32_optimizer_states"] = False
         ds_cfg["zero_optimization"]["offload_optimizer"] = {
@@ -853,6 +860,7 @@ def main():
             "total_update_steps": total_update_steps,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "offload_optimizer": args.offload_optimizer,
+            "zero_stage": args.zero_stage,
             "use_lora": args.use_lora,
             "lora_r": args.lora_r if args.use_lora else None,
             "lora_alpha": args.lora_alpha if args.use_lora else None,
