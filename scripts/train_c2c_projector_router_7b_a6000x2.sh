@@ -36,9 +36,41 @@ fi
 ENV_NAME="${ENV_NAME:-${CONDA_DEFAULT_ENV:-route-IRL}}"
 ROUTER_MODEL="${ROUTER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}"
-DATA_DIR="${DATA_DIR:-data/c2c_projectors_p123}"
-OUT_DIR="${OUT_DIR:-checkpoints_c2c_projectors_p123_alltrain_qwen25_7b_lora_a6000x2}"
-LOG_DIR="${LOG_DIR:-logs/c2c_projector_router_7b_a6000x2}"
+ROUTER_SOURCE="${ROUTER_SOURCE:-alltrain}"
+case "$ROUTER_SOURCE" in
+  alltrain)
+    DATA_DIR_DEFAULT="data/c2c_projectors_p123"
+    OUT_DIR_DEFAULT="checkpoints_c2c_projectors_p123_alltrain_qwen25_7b_lora_a6000x2"
+    EXTRA_TAG_DEFAULT="alltrain,lora"
+    RUN_SUFFIX_DEFAULT="alltrain"
+    ;;
+  mcq)
+    DATA_DIR_DEFAULT="data/c2c_projectors_p123_mcq"
+    OUT_DIR_DEFAULT="checkpoints_c2c_projectors_p123_mcq_qwen25_7b_lora_a6000x2"
+    EXTRA_TAG_DEFAULT="mcq,lora"
+    RUN_SUFFIX_DEFAULT="mcq"
+    ;;
+  challenging)
+    DATA_DIR_DEFAULT="data/c2c_projectors_p123_mcq_challenging_router"
+    OUT_DIR_DEFAULT="checkpoints_c2c_projectors_p123_challenging_qwen25_7b_lora_a6000x2"
+    EXTRA_TAG_DEFAULT="challenging,lora"
+    RUN_SUFFIX_DEFAULT="challenging"
+    ;;
+  *)
+    echo "unsupported ROUTER_SOURCE=$ROUTER_SOURCE (expected alltrain, mcq, challenging)" >&2
+    exit 1
+    ;;
+esac
+DATA_DIR="${DATA_DIR:-$DATA_DIR_DEFAULT}"
+OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
+if [[ -z "${STAGE1_OUT_DIR:-}" ]]; then
+  if [[ "$ROUTER_SOURCE" == "alltrain" ]]; then
+    STAGE1_OUT_DIR="$OUT_DIR"
+  else
+    STAGE1_OUT_DIR="checkpoints_c2c_projectors_p123_alltrain_qwen25_7b_lora_a6000x2"
+  fi
+fi
+LOG_DIR="${LOG_DIR:-logs/c2c_projector_router_7b_a6000x2_${RUN_SUFFIX_DEFAULT}}"
 
 STAGE1_KEY="${STAGE1_KEY:-icl_stage1_qwen25_7b_lora_projector_p123_alltrain}"
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-3}"
@@ -71,9 +103,9 @@ SEED="${SEED:-42}"
 WANDB_PROJECT="${WANDB_PROJECT:-C2C_IRL}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_TAGS="${WANDB_TAGS:-paper_code,c2c_projector_router,p123,7b,a6000x2}"
-WANDB_EXTRA_TAGS="${WANDB_EXTRA_TAGS:-alltrain,lora}"
+WANDB_EXTRA_TAGS="${WANDB_EXTRA_TAGS:-$EXTRA_TAG_DEFAULT}"
 STAGE1_WANDB_RUN_NAME="${STAGE1_WANDB_RUN_NAME:-c2c-p123-alltrain-stage1-qwen25-7b-lora-a6000x2}"
-STAGE2_WANDB_RUN_NAME="${STAGE2_WANDB_RUN_NAME:-c2c-p123-alltrain-stage2-qwen25-7b-lora-a6000x2}"
+STAGE2_WANDB_RUN_NAME="${STAGE2_WANDB_RUN_NAME:-c2c-p123-${RUN_SUFFIX_DEFAULT}-stage2-qwen25-7b-lora-a6000x2}"
 
 required_files=(
   "$DATA_DIR/question_train.json"
@@ -90,10 +122,10 @@ for file in "${required_files[@]}"; do
   fi
 done
 
-mkdir -p "$OUT_DIR" "$STAGE2_OUT_DIR" "$LOG_DIR"
+mkdir -p "$OUT_DIR" "$STAGE1_OUT_DIR" "$STAGE2_OUT_DIR" "$LOG_DIR"
 
 stage2_cache_file="$STAGE2_OUT_DIR/${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt"
-default_stage2_cache_file="$OUT_DIR/stage2/${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt"
+default_stage2_cache_file="${DEFAULT_STAGE2_CACHE_FILE:-$STAGE1_OUT_DIR/stage2/${EMBED_MODEL##*/}_stage2_c2c_p123_profile500.pt}"
 if [[ ! -s "$stage2_cache_file" && -s "$default_stage2_cache_file" ]]; then
   cp "$default_stage2_cache_file" "$stage2_cache_file"
   echo "[$(date '+%F %T')] copied stage2 embedding cache from $default_stage2_cache_file"
@@ -115,8 +147,8 @@ run_ds() {
 }
 
 stage1_last_epoch=$((STAGE1_EPOCHS - 1))
-stage1_llm="$OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/llm"
-stage1_projector="$OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/projector"
+stage1_llm="$STAGE1_OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/llm"
+stage1_projector="$STAGE1_OUT_DIR/$STAGE1_KEY/epoch_${stage1_last_epoch}/projector"
 stage1_llm_config="$stage1_llm/config.json"
 stage1_lora_config="$stage1_llm/adapter_config.json"
 stage1_projector_weights="$stage1_projector/model.safetensors"
@@ -125,8 +157,10 @@ echo "[$(date '+%F %T')] GPUs=$GPUS_STRING NUM_GPUS=$NUM_GPUS"
 echo "[$(date '+%F %T')] deepspeed_include=$DS_INCLUDE"
 echo "[$(date '+%F %T')] master_port=$MASTER_PORT"
 echo "[$(date '+%F %T')] router_model=$ROUTER_MODEL embed_model=$EMBED_MODEL"
+echo "[$(date '+%F %T')] router_source=$ROUTER_SOURCE"
 echo "[$(date '+%F %T')] data_dir=$DATA_DIR"
 echo "[$(date '+%F %T')] output_dir=$OUT_DIR"
+echo "[$(date '+%F %T')] stage1_output_dir=$STAGE1_OUT_DIR"
 echo "[$(date '+%F %T')] use_lora=$USE_LORA lora_r=$LORA_R stage2_freeze_llm=$STAGE2_FREEZE_LLM zero_stage=$ZERO_STAGE"
 echo "[$(date '+%F %T')] stage2_batch=$STAGE2_BATCH_SIZE grad_accum=$STAGE2_GRAD_ACCUM eval_steps=$STAGE2_EVAL_STEPS eval_max_batches=$STAGE2_EVAL_MAX_BATCHES"
 
@@ -158,7 +192,7 @@ if [[ "${SKIP_STAGE1:-0}" != "1" && ( ! -s "$stage1_llm_config" || ! -s "$stage1
     --num_train_epochs "$STAGE1_EPOCHS" \
     "${lora_args[@]}" \
     --projector_type nonlinear \
-    --output_dir "$OUT_DIR" \
+    --output_dir "$STAGE1_OUT_DIR" \
     --ckpt_key "$STAGE1_KEY" \
     --cached_embedding_file "${EMBED_MODEL##*/}_stage1_c2c_p123.pt" \
     --wandb_project "$WANDB_PROJECT" \

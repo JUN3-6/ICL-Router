@@ -26,6 +26,16 @@ script. The default dataset uses all 3659 train queries with four labels per
 query and does not use the previous `router_source=challenging` subset. The
 training script intentionally does not regenerate labels.
 
+To train stage2 on the discriminative challenge subset instead, use:
+
+```bash
+ROUTER_SOURCE=challenging bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
+```
+
+This selects `data/c2c_projectors_p123_mcq_challenging_router` for stage2
+router rows and reuses the default alltrain stage1 projector/adapter unless
+`STAGE1_OUT_DIR` is explicitly overridden.
+
 ## Train
 
 Create the conda environment first:
@@ -54,6 +64,7 @@ bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 Useful overrides:
 
 ```bash
+ROUTER_SOURCE=alltrain|mcq|challenging \
 DATA_DIR=/path/to/router_data \
 OUT_DIR=/path/to/checkpoints \
 WANDB_PROJECT=C2C_IRL \
@@ -63,7 +74,7 @@ bash scripts/train_c2c_projector_router_7b_a6000x2.sh 0,1
 Default effective batch sizes:
 
 - stage1: `2 GPUs * batch 1 * grad_accum 8 = 16`
-- stage2: `2 GPUs * batch 1 * grad_accum 16 = 32`
+- stage2: `2 GPUs * batch 2 * grad_accum 16 = 64`
 
 The default A6000 path trains the 7B router LLM through LoRA:
 
