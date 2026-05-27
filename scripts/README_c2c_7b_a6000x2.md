@@ -34,7 +34,9 @@ ROUTER_SOURCE=challenging bash scripts/train_c2c_projector_router_7b_a6000x2.sh 
 
 This selects `data/c2c_projectors_p123_mcq_challenging_router` for stage2
 router rows and reuses the default alltrain stage1 projector/adapter unless
-`STAGE1_OUT_DIR` is explicitly overridden.
+`STAGE1_OUT_DIR` is explicitly overridden. For `ROUTER_SOURCE=challenging`,
+stage2 defaults to `STAGE2_ROUTING_LOSS=group_softmax`, which optimizes the
+query-level candidate ranking instead of independent row-wise Yes/No BCE.
 
 ## Train
 
@@ -65,6 +67,7 @@ Useful overrides:
 
 ```bash
 ROUTER_SOURCE=alltrain|mcq|challenging \
+STAGE2_ROUTING_LOSS=row_bce|group_softmax \
 DATA_DIR=/path/to/router_data \
 OUT_DIR=/path/to/checkpoints \
 WANDB_PROJECT=C2C_IRL \

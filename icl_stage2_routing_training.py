@@ -119,6 +119,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Per-GPU micro-batch size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of micro-batches to accumulate before each optimizer update.")
+    parser.add_argument("--routing_loss", choices=["row_bce", "group_softmax"], default="row_bce",
+                        help="Stage2 objective. group_softmax optimizes query-level candidate ranking.")
     parser.add_argument("--eval_steps", type=int, default=0,
                         help="Run validation every N optimizer update steps. Set 0 to disable during training.")
     parser.add_argument("--eval_max_batches", type=int, default=0,
@@ -398,6 +400,40 @@ def custom_collate_fn(batch, tokenizer):
     return pad_batch(out, pad_token_id=tokenizer.pad_token_id, label_pad_token_id=-100)
 
 
+class QueryGroupDataset(torch.utils.data.Dataset):
+    """Group processed candidate rows by query so one item is one routing decision."""
+
+    def __init__(self, row_ds):
+        self.row_ds = row_ds
+        groups = {}
+        for idx, row in enumerate(row_ds):
+            key = (row["query"], int(row["index"]))
+            groups.setdefault(key, []).append(idx)
+        self.group_indices = list(groups.values())
+
+    def __len__(self):
+        return len(self.group_indices)
+
+    def __getitem__(self, idx):
+        return [self.row_ds[row_idx] for row_idx in self.group_indices[idx]]
+
+
+def group_collate_fn(batch_groups, tokenizer):
+    flat_rows = []
+    group_ids = []
+    group_sizes = []
+    for group_id, rows in enumerate(batch_groups):
+        group_sizes.append(len(rows))
+        for row in rows:
+            flat_rows.append(row)
+            group_ids.append(group_id)
+
+    out = custom_collate_fn(flat_rows, tokenizer)
+    out["group_ids"] = torch.tensor(group_ids, dtype=torch.long)
+    out["group_sizes"] = torch.tensor(group_sizes, dtype=torch.long)
+    return out
+
+
 def get_rank() -> int:
     """Return the global rank (0 if not using distributed)."""
     return dist.get_rank() if dist.is_initialized() else 0
@@ -452,6 +488,39 @@ def yes_no_scores(logits: Tensor, labels: Tensor, yes_id: int, no_id: int) -> tu
 
     diff = logits[b_idx, logit_pos, yes_id] - logits[b_idx, logit_pos, no_id]
     return diff, targets
+
+
+def group_softmax_loss(scores: Tensor, targets: Tensor, group_ids: Tensor) -> tuple[Tensor, Dict[str, float]]:
+    losses = []
+    selected_correct = []
+    positive_group_count = 0
+    skipped_no_positive = 0
+    for group_id in torch.unique(group_ids, sorted=True):
+        mask = group_ids == group_id
+        group_scores = scores[mask]
+        group_targets = targets[mask].bool()
+        if not torch.any(group_targets):
+            skipped_no_positive += 1
+            continue
+        positive_group_count += 1
+        losses.append(
+            -(
+                torch.logsumexp(group_scores[group_targets], dim=0)
+                - torch.logsumexp(group_scores, dim=0)
+            )
+        )
+        selected_correct.append(group_targets[torch.argmax(group_scores)].float())
+
+    if not losses:
+        raise RuntimeError("group_softmax_loss received no groups with a positive candidate.")
+
+    loss = torch.stack(losses).mean()
+    stats = {
+        "group_selected_correct": float(torch.stack(selected_correct).mean().detach().cpu()),
+        "positive_group_count": float(positive_group_count),
+        "skipped_no_positive": float(skipped_no_positive),
+    }
+    return loss, stats
 
 
 def validate_router(
@@ -545,9 +614,20 @@ def validate_router(
         for row in all_rows:
             grouped[(row["query"], row["index"])].append(row)
         selected = [max(rows, key=lambda row: row["score"]) for rows in grouped.values() if rows]
+        group_losses = []
+        for rows in grouped.values():
+            if not any(row["is_correct_direct"] for row in rows):
+                continue
+            max_score = max(row["score"] for row in rows)
+            denom = max_score + math.log(sum(math.exp(row["score"] - max_score) for row in rows))
+            numer = max_score + math.log(
+                sum(math.exp(row["score"] - max_score) for row in rows if row["is_correct_direct"])
+            )
+            group_losses.append(-(numer - denom))
         metrics["stage2/val_selected_correct"] = (
             sum(row["is_correct_direct"] for row in selected) / max(1, len(selected))
         )
+        metrics["stage2/val_group_loss"] = sum(group_losses) / max(1, len(group_losses))
         metrics["stage2/val_oracle_possible"] = (
             sum(any(row["is_correct_direct"] for row in rows) for rows in grouped.values())
             / max(1, len(grouped))
@@ -858,13 +938,24 @@ def main():
     )
 
     collate_fn = partial(custom_collate_fn, tokenizer=tokenizer)
+    train_groups = None
+    if args.routing_loss == "group_softmax":
+        train_groups = QueryGroupDataset(train_ds)
+        train_loader_ds = train_groups
+        train_collate_fn = partial(group_collate_fn, tokenizer=tokenizer)
+        train_drop_last = True
+    else:
+        train_loader_ds = train_ds
+        train_collate_fn = collate_fn
+        train_drop_last = True
+
     if args.local_rank != -1:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, seed=args.seed, shuffle=True, drop_last=True)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_loader_ds, seed=args.seed, shuffle=True, drop_last=True)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False, drop_last=False)
-        train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, collate_fn=collate_fn, drop_last=True)
+        train_dl = torch.utils.data.DataLoader(train_loader_ds, batch_size=args.batch_size, sampler=train_sampler, collate_fn=train_collate_fn, drop_last=train_drop_last)
         val_dl   = torch.utils.data.DataLoader(val_ds,   batch_size=args.batch_size, sampler=val_sampler,   collate_fn=collate_fn, drop_last=False)
     else:
-        train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  collate_fn=collate_fn, drop_last=True)
+        train_dl = torch.utils.data.DataLoader(train_loader_ds, batch_size=args.batch_size, shuffle=True,  collate_fn=train_collate_fn, drop_last=train_drop_last)
         val_dl   = torch.utils.data.DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, drop_last=False)
 
     # ---------------- DeepSpeed config --------------
@@ -1033,7 +1124,7 @@ def main():
     total_steps = total_micro_steps
     pbar = tqdm.tqdm(total=total_steps)
 
-    save_key = f"{args.projector_type}_router_" \
+    save_key = f"{args.projector_type}_router_{args.routing_loss}_" \
                f"projLR{args.proj_lr}_llmLR{args.llm_lr}_epochs{args.num_train_epochs}_" \
                f"{Path(args.embed_model_name_or_path).name}_seed{args.seed}"
     (Path(args.output_dir) / save_key).mkdir(parents=True, exist_ok=True)
@@ -1045,7 +1136,9 @@ def main():
             "train_micro_steps": total_micro_steps,
             "train_update_steps": total_update_steps,
             "train_rows": len(train_ds),
+            "train_groups": len(train_groups) if train_groups is not None else None,
             "validation_rows": len(val_ds),
+            "routing_loss": args.routing_loss,
             "micro_batch_size_per_gpu": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "effective_batch_size": args.batch_size
@@ -1093,7 +1186,15 @@ def main():
 
             # Binary-cross-entropy over the single answer token
             diff, targets = yes_no_scores(logits, labels, yes_id, no_id)
-            loss = F.binary_cross_entropy_with_logits(diff, targets)
+            if args.routing_loss == "group_softmax":
+                loss, batch_group_stats = group_softmax_loss(diff, targets, batch["group_ids"].to(device))
+            else:
+                loss = F.binary_cross_entropy_with_logits(diff, targets)
+                batch_group_stats = {
+                    "group_selected_correct": -1.0,
+                    "positive_group_count": 0.0,
+                    "skipped_no_positive": 0.0,
+                }
             pos_rate = targets.mean()
 
             model_engine.backward(loss)
@@ -1116,11 +1217,18 @@ def main():
             with torch.no_grad():
                 red_loss = loss.clone()
                 red_pos_rate = pos_rate.clone()
+                red_group_selected = torch.tensor(
+                    batch_group_stats["group_selected_correct"],
+                    device=device,
+                    dtype=torch.float32,
+                )
                 if dist.is_initialized():
                     dist.all_reduce(red_loss)
                     dist.all_reduce(red_pos_rate)
+                    dist.all_reduce(red_group_selected)
                     red_loss /= dist.get_world_size()
                     red_pos_rate /= dist.get_world_size()
+                    red_group_selected /= dist.get_world_size()
             if get_rank() == 0:
                 accum_loss_sum += float(red_loss.item())
                 accum_loss_count += 1
@@ -1144,6 +1252,9 @@ def main():
                         "stage2/train_loss_ema": float(loss_ema),
                         "stage2/accum_loss_mean": float(accum_loss_mean),
                         "stage2/batch_pos_rate": float(red_pos_rate.item()),
+                        "stage2/train_group_selected_correct": float(red_group_selected.item()),
+                        "stage2/train_positive_group_count": float(batch_group_stats["positive_group_count"]),
+                        "stage2/train_skipped_no_positive": float(batch_group_stats["skipped_no_positive"]),
                         "stage2/grad_norm": grad_norm_value,
                         "stage2/epoch": epoch,
                         "stage2/progress": global_step / max(1, total_steps),

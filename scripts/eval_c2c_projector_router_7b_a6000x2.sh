@@ -23,16 +23,21 @@ STAGE2_OUT_DIR="${STAGE2_OUT_DIR:-$OUT_DIR/stage2}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 STAGE2_PROJ_LR="${STAGE2_PROJ_LR:-1e-5}"
 STAGE2_LLM_LR="${STAGE2_LLM_LR:-2e-6}"
+STAGE2_ROUTING_LOSS="${STAGE2_ROUTING_LOSS:-}"
 SEED="${SEED:-42}"
 LOG_DIR="${LOG_DIR:-logs/c2c_projector_router_7b_a6000x2}"
 EVAL_DIR="${EVAL_DIR:-eval/c2c_projector_router_7b_a6000x2}"
 
-save_key="nonlinear_router_projLR${STAGE2_PROJ_LR}_llmLR${STAGE2_LLM_LR}_epochs${STAGE2_EPOCHS}_${EMBED_MODEL##*/}_seed${SEED}"
+if [[ -n "$STAGE2_ROUTING_LOSS" ]]; then
+  save_key="nonlinear_router_${STAGE2_ROUTING_LOSS}_projLR${STAGE2_PROJ_LR}_llmLR${STAGE2_LLM_LR}_epochs${STAGE2_EPOCHS}_${EMBED_MODEL##*/}_seed${SEED}"
+else
+  save_key="nonlinear_router_projLR${STAGE2_PROJ_LR}_llmLR${STAGE2_LLM_LR}_epochs${STAGE2_EPOCHS}_${EMBED_MODEL##*/}_seed${SEED}"
+fi
 default_checkpoint="$(find "$STAGE2_OUT_DIR/$save_key" -maxdepth 1 -type d -name 'final_step*' 2>/dev/null | sort -V | tail -n 1 || true)"
 if [[ -z "$default_checkpoint" ]]; then
   default_checkpoint="$(
     find "$STAGE2_OUT_DIR" -maxdepth 2 -type d \
-      -path "*/nonlinear_router_projLR*_llmLR*_epochs${STAGE2_EPOCHS}_${EMBED_MODEL##*/}_seed${SEED}/final_step*" \
+      -path "*/nonlinear_router*_projLR*_llmLR*_epochs${STAGE2_EPOCHS}_${EMBED_MODEL##*/}_seed${SEED}/final_step*" \
       2>/dev/null | sort -V | tail -n 1 || true
   )"
 fi

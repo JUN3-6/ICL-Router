@@ -92,6 +92,13 @@ STAGE2_OUT_DIR="${STAGE2_OUT_DIR:-$OUT_DIR/stage2}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-2}"
 STAGE2_GRAD_ACCUM="${STAGE2_GRAD_ACCUM:-16}"
+if [[ -z "${STAGE2_ROUTING_LOSS:-}" ]]; then
+  if [[ "$ROUTER_SOURCE" == "challenging" ]]; then
+    STAGE2_ROUTING_LOSS="group_softmax"
+  else
+    STAGE2_ROUTING_LOSS="row_bce"
+  fi
+fi
 STAGE2_EVAL_STEPS="${STAGE2_EVAL_STEPS:-50}"
 STAGE2_EVAL_MAX_BATCHES="${STAGE2_EVAL_MAX_BATCHES:-128}"
 STAGE2_MAX_LENGTH="${STAGE2_MAX_LENGTH:-1024}"
@@ -162,7 +169,7 @@ echo "[$(date '+%F %T')] data_dir=$DATA_DIR"
 echo "[$(date '+%F %T')] output_dir=$OUT_DIR"
 echo "[$(date '+%F %T')] stage1_output_dir=$STAGE1_OUT_DIR"
 echo "[$(date '+%F %T')] use_lora=$USE_LORA lora_r=$LORA_R stage2_freeze_llm=$STAGE2_FREEZE_LLM zero_stage=$ZERO_STAGE"
-echo "[$(date '+%F %T')] stage2_batch=$STAGE2_BATCH_SIZE grad_accum=$STAGE2_GRAD_ACCUM eval_steps=$STAGE2_EVAL_STEPS eval_max_batches=$STAGE2_EVAL_MAX_BATCHES"
+echo "[$(date '+%F %T')] stage2_batch=$STAGE2_BATCH_SIZE grad_accum=$STAGE2_GRAD_ACCUM routing_loss=$STAGE2_ROUTING_LOSS eval_steps=$STAGE2_EVAL_STEPS eval_max_batches=$STAGE2_EVAL_MAX_BATCHES"
 
 lora_args=()
 if [[ "$USE_LORA" == "1" ]]; then
@@ -240,6 +247,7 @@ run_ds icl_stage2_routing_training.py \
   --output_dir "$STAGE2_OUT_DIR" \
   --batch_size "$STAGE2_BATCH_SIZE" \
   --gradient_accumulation_steps "$STAGE2_GRAD_ACCUM" \
+  --routing_loss "$STAGE2_ROUTING_LOSS" \
   --eval_steps "$STAGE2_EVAL_STEPS" \
   --eval_max_batches "$STAGE2_EVAL_MAX_BATCHES" \
   --offload_optimizer "$OFFLOAD_OPTIMIZER" \
