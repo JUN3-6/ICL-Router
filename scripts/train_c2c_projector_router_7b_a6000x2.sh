@@ -22,11 +22,15 @@ GPUS_STRING="${1:-${GPUS:-0,1}}"
 IFS=',' read -r -a GPUS <<< "$GPUS_STRING"
 NUM_GPUS="${#GPUS[@]}"
 
-export CUDA_VISIBLE_DEVICES="$GPUS_STRING"
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+DS_INCLUDE="${DS_INCLUDE:-localhost:$GPUS_STRING}"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  echo "[$(date '+%F %T')] ignoring existing CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES; using DeepSpeed include=$DS_INCLUDE"
+  unset CUDA_VISIBLE_DEVICES
+fi
 
 ENV_NAME="${ENV_NAME:-${CONDA_DEFAULT_ENV:-route-IRL}}"
 ROUTER_MODEL="${ROUTER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
@@ -96,7 +100,7 @@ fi
 
 run_ds() {
   conda run --no-capture-output -n "$ENV_NAME" deepspeed \
-    --num_gpus "$NUM_GPUS" \
+    --include "$DS_INCLUDE" \
     --master_port "$MASTER_PORT" \
     "$@"
 }
@@ -109,6 +113,7 @@ stage1_lora_config="$stage1_llm/adapter_config.json"
 stage1_projector_weights="$stage1_projector/model.safetensors"
 
 echo "[$(date '+%F %T')] GPUs=$GPUS_STRING NUM_GPUS=$NUM_GPUS"
+echo "[$(date '+%F %T')] deepspeed_include=$DS_INCLUDE"
 echo "[$(date '+%F %T')] master_port=$MASTER_PORT"
 echo "[$(date '+%F %T')] router_model=$ROUTER_MODEL embed_model=$EMBED_MODEL"
 echo "[$(date '+%F %T')] data_dir=$DATA_DIR"
