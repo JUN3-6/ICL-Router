@@ -27,6 +27,7 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 DS_INCLUDE="${DS_INCLUDE:-localhost:$GPUS_STRING}"
+CACHE_GPU="${CACHE_GPU:-${GPUS[0]}}"
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   echo "[$(date '+%F %T')] ignoring existing CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES; using DeepSpeed include=$DS_INCLUDE"
   unset CUDA_VISIBLE_DEVICES
@@ -97,6 +98,14 @@ if [[ ! -s "$stage2_cache_file" && -s "$default_stage2_cache_file" ]]; then
   cp "$default_stage2_cache_file" "$stage2_cache_file"
   echo "[$(date '+%F %T')] copied stage2 embedding cache from $default_stage2_cache_file"
 fi
+echo "[$(date '+%F %T')] checking stage2 embedding cache on GPU $CACHE_GPU"
+CUDA_VISIBLE_DEVICES="$CACHE_GPU" conda run --no-capture-output -n "$ENV_NAME" \
+  python scripts/precompute_c2c_stage2_embedding_cache.py \
+    --experts-information-file "$DATA_DIR/experts_information_500.json" \
+    --embed-model-name-or-path "$EMBED_MODEL" \
+    --cache-file "$stage2_cache_file" \
+    --batch-size "${CACHE_BATCH_SIZE:-2}" \
+    --max-length "$STAGE2_MAX_LENGTH"
 
 run_ds() {
   conda run --no-capture-output -n "$ENV_NAME" deepspeed \
